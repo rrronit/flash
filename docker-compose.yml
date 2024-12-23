@@ -1,0 +1,28 @@
+
+services:
+  judge:
+    image: judge
+    build: .
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - .:/api/:rw
+    ports:
+      - "127.0.0.1:3002:3000"
+    depends_on:
+      - redis
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:latest
+    ports:
+      - 6380:6379
+
+volumes:
+  redis_data:
