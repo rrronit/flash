@@ -4,8 +4,6 @@ services:
     image: judge
     build: .
     privileged: true
-    security_opt:
-      - seccomp:unconfined
     volumes:
       - .:/api/:rw
     ports:

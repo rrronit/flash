@@ -1,53 +1,33 @@
+use crate::{client::redis::RedisClient, core::job::Job};
+use serde_json;
 
-use rand::Rng;
-use redis::Commands;
+/// Creates a new job and stores it in Redis.
+pub async fn create_job(redis: &RedisClient, job: Job) -> Result<String, String> {
+    let job_id = job.id.to_string();
 
-use crate::client::redis::redis_client;
+    redis
+        .store_job(&job_id, &job, None)
+        .await
+        .map_err(|e| e.to_string())?;
 
-pub fn create_job(
-    code: &str,
-    language: &str,
-    input: &str,
-    expected: &str,
-    time_limit: u64,
-    memory_limit: u64,
-    stack_limit: u64,
-) -> String {
-    let job_id = rand::thread_rng().gen_range(1..1000).to_string();
+    redis
+        .enqueue_job("jobs", &job)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let client = redis_client();
-    let mut conn = client.get_connection().unwrap();
-
-    let job = serde_json::json!({
-        "_id": job_id,
-        "_code": code,
-        "_language": language,
-        "_input": input,
-        "_status": "pending",
-        "_expected": expected,
-        "_result": "",
-        "_error": "",
-        "_time": time_limit,
-        "_memory": memory_limit,
-        "_stack": stack_limit,
-        "_created_at": std::time::Instant::now().elapsed().as_nanos(),
-    });
-
-    let job = serde_json::to_string(&job).unwrap();
-    let _: () = conn.set(job_id.clone(), &job).unwrap();
-    let _: () = conn.rpush("jobs", job).unwrap();
-
-    job_id
+    Ok(job_id)
 }
 
-pub fn check_job(job_id: &str) -> Result<String, String> {
-    let client = redis_client();
-    let mut conn = client.get_connection().unwrap();
+/// Retrieves a job from Redis by its ID.
+pub async fn check_job(redis: &RedisClient, job_id: &str) -> Result<Job, String> {
+    let data=redis
+        .get_job(job_id)
+        .await
+        .map_err(|e| e.to_string());
 
-    let job: Result<String, redis::RedisError> = conn.get(job_id);
-
-    match job {
-        Ok(job) => Ok(job),
-        Err(_) => Err("Job not found".to_string()),
+    match data {
+        Ok(Some(job)) => Ok(job),
+        Ok(None) => Err("Job not found".to_string()),
+        Err(e) => Err(e),
     }
 }

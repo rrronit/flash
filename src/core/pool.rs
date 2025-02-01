@@ -1,84 +1,86 @@
-use std::process::Output;
-
-use redis::Commands;
-
-use crate::{client::redis::redis_client, vendors::Isolate};
-
 use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+use thiserror::Error;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Code {
-    pub _id: String,
-    pub _code: String,
-    pub _language: String,
-    pub _status: String,
-    pub _input: String,
-    pub _expected: String,
-    pub _result: String,
-    pub _error: String,
-    pub _time: i32,
-    pub _memory: i32,
-    pub _stack: i32,
-    pub _created_at: u128,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Job {
+    pub id: u128,
+    pub source_code: String,
+    pub language: Language,
+    pub stdin: String,
+    pub expected_output: String,
+    pub settings: ExecutionSettings,
+    pub status: JobStatus,
+    pub created_at: SystemTime,
+    pub started_at: Option<SystemTime>,
+    pub finished_at: Option<SystemTime>,
+    pub output: JobOutput,
 }
 
-pub fn _thread_pool(_pool_count: i32) {
-    let mut handles = Vec::new();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobOutput {
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub compile_output: Option<String>,
+    pub time: Option<f64>,
+    pub memory: Option<u64>,
+    pub exit_code: Option<i32>,
+}
 
-    for _ in 0.._pool_count {
-        let client = redis_client();
-        let handle = std::thread::spawn(move || {
-            let mut conn = client.get_connection().unwrap();
-            loop {
-                let job: redis::RedisResult<Option<String>> = conn.lpop("jobs", None);
-                match job {
-                    Ok(job) => match job {
-                        Some(job) => {
-                            //parse code from job
-                            let work: Code = serde_json::from_str(&job).unwrap();
-                            // let work_id = work._id;
-                            let result = process_job(work);
-                            // if result.status.success() {
-                            //     let output = String::from_utf8_lossy(&result.stdout).to_string();
-                            //     let old_data: String = conn.get(work_id.to_string()).unwrap();
-                            //     let mut old_work: Code = serde_json::from_str(&old_data).unwrap();
-                            //     old_work._result = output;
-                            //     old_work._status = "completed".to_string();
-                            //     let new_data = serde_json::to_string(&old_work).unwrap();
-                            //     let _: () = conn
-                            //         .set_ex(work_id.to_string(), new_data, 10 * 60 * 60)
-                            //         .unwrap();
-                            // } else {
-                            //     let output = String::from_utf8_lossy(&result.stderr).to_string();
-                            //     let old_data: String = conn.get(work_id.to_string()).unwrap();
-                            //     let mut old_work: Code = serde_json::from_str(&old_data).unwrap();
-                            //     old_work._error = output;
-                            //     old_work._status = "failed".to_string();
-                            //     let new_data = serde_json::to_string(&old_work).unwrap();
-                            //     let _: () = conn
-                            //         .set_ex(work_id.to_string(), new_data, 10 * 60 * 60)
-                            //         .unwrap();
-                            // }
-                            println!("{:?}", result);
-                        }
-                        None => {
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                        }
-                    },
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
-                }
-            }
-        });
-        handles.push(handle);
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JobStatus {
+    Queued,
+    Processing,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Error, Debug)]
+pub enum JobError {
+    #[error("Invalid job configuration")]
+    ConfigurationError,
+    #[error("Execution timeout")]
+    TimeoutError,
+    #[error("Memory limit exceeded")]
+    MemoryLimitExceeded,
+    #[error("Compilation failed: {0}")]
+    CompilationError(String),
+    #[error("Runtime error: {0}")]
+    RuntimeError(String),
+}
+
+impl Job {
+    pub fn new(source_code: String, language: Language) -> Self {
+        Self {
+            id: rand::random(),
+            source_code,
+            language,
+            ..Default::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), JobError> {
+        if self.source_code.is_empty() {
+            return Err(JobError::ConfigurationError);
+        }
+        Ok(())
     }
 }
 
-fn process_job(job: Code) -> Output {
-    let mut isolate = Isolate::new(job);
-
-    let output = isolate.compile();
-    // let output = isolate.run();
-    output.unwrap()
+impl Default for Job {
+    fn default() -> Self {
+        Self {
+            id: rand::random(),
+            source_code: String::new(),
+            language: Language::default(),
+            stdin: String::new(),
+            expected_output: String::new(),
+            settings: ExecutionSettings::default(),
+            status: JobStatus::Queued,
+            created_at: SystemTime::now(),
+            started_at: None,
+            finished_at: None,
+            output: JobOutput::default(),
+        }
+    }
 }
