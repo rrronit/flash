@@ -2,7 +2,6 @@ use redis::{AsyncCommands, RedisResult};
 use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 
-use crate::core::job;
 
 #[derive(Clone)]
 pub struct RedisClient {
@@ -47,14 +46,23 @@ impl RedisClient {
 
     pub async fn get_job_from_queue<T: DeserializeOwned>(&self, queue: &str) -> RedisResult<Option<T>> {
         let mut conn = self.get_connection().await?;
-        let job_data: Option<String> = conn.lpop(queue, None).await?;
-
-        if let Some(data) = job_data {
-            let job: T = serde_json::from_str(&data)
-                .map_err(|e| redis::RedisError::from((redis::ErrorKind::TypeError, "deserialization failed", e.to_string())))?;
-            Ok(Some(job))
-        } else {
-            Ok(None)
+        
+        // Use BRPOP with 1-second timeout to block until job arrives
+        let result: Option<(String, String)> = conn.brpop(queue, 1.0).await?;
+    
+        match result {
+            Some((_list_name, data)) => {
+                // Deserialize the JSON data
+                let job = serde_json::from_str(&data)
+                    .map_err(|e| redis::RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Job deserialization failed",
+                        e.to_string()
+                    )))?;
+                
+                Ok(Some(job))
+            }
+            None => Ok(None), 
         }
     }
 }

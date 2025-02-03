@@ -2,7 +2,7 @@ use crate::{
     client::redis::RedisClient,
     core::{Job, JobError, JobStatus},
 };
-use std::{fs::File, io::Write, path::PathBuf};
+use std::{fs::File, path::PathBuf};
 use tokio::process::Command;
 
 #[derive(Clone)]
@@ -16,16 +16,17 @@ impl IsolateExecutor {
     }
 
     pub async fn execute(&self, job: &mut Job) -> Result<(), JobError> {
-        let box_id = job.id % 1000;
+        let box_id = job.id % 2147483647;
         let _box_path = PathBuf::from(format!("/var/lib/isolate/{}", box_id));
 
         println!("Executing job: {}", job.id);
 
-        // Cleanup previous box
         let _ = Command::new("isolate")
-            .args(&["-b", &box_id.to_string(), "--cleanup"])
-            .status()
-            .await;
+        .args(&["-b", &box_id.to_string(), "--cleanup"])
+        .output()
+        .await
+        .unwrap();
+
 
         // Initialize new box
         let init_output = Command::new("isolate")
@@ -34,13 +35,11 @@ impl IsolateExecutor {
             .await
             .unwrap();
 
-        println!("Box initialized: {}", box_id);
 
         let box_path = String::from_utf8_lossy(&init_output.stdout)
             .trim()
             .to_string();
 
-        println!("Box path: {}", box_path);
 
         let file_path = format!("{}/box", box_path);
         let stdin_file = format!("{}/stdin", file_path);
@@ -49,17 +48,15 @@ impl IsolateExecutor {
 
         // Write source code
         let source_path = format!("{}/{}", file_path, job.language.source_file);
-
+   
         tokio::fs::write(&source_path, &job.source_code)
             .await
-            .unwrap();
-        tokio::fs::write(&stdin_file, &job.stdin).await.unwrap();
+            .expect(format!("Failed to write source code to {}", source_path).as_str());
+        tokio::fs::write(&stdin_file, &job.stdin).await.expect(format!("Failed to write stdin to {}", stdin_file).as_str());
 
-        let stdin_file = File::open(stdin_file).unwrap();
-        let stdout_file = File::create(stdout_file).unwrap();
-        let stderr_file = File::create(stderr_file).unwrap();
-
-        println!("Source code written to: {}", source_path);
+        let stdin_file = File::open(stdin_file).expect(format!("Failed to open stdin file {}", box_id).as_str());
+        let stdout_file = File::create(stdout_file).expect(format!("Failed to open stdout file {}", box_id).as_str());
+        let stderr_file = File::create(stderr_file).expect(format!("Failed to open stderr file {}", box_id).as_str());
 
         // Run compilation if needed
         if let Some(compile_cmd) = &job.language.compile_cmd {
@@ -75,16 +72,16 @@ impl IsolateExecutor {
                 ])
                 .status()
                 .await
-                .unwrap();
+                .expect(format!("Failed to compile job {}", job.id).as_str());
 
             if !compile_status.success() {
                 job.status = JobStatus::Failed("Compilation failed".into());
                 self.update_job_in_redis(job).await?;
-                return Err(JobError::CompilationError("Compilation failed".into()));
+                return Err(JobError::_CompilationError);
             }
         }
 
-        println!("Compilation successful");
+
 
         let lang = &job.language.run_cmd.split(" ").collect::<Vec<&str>>();
         // Execute the program
@@ -108,8 +105,10 @@ impl IsolateExecutor {
             .await
             .unwrap();
 
-        println!("Execution completed");
-        println!("Exit code: {:?} {:?}",box_id, output.status.code());
+        println!("job finished: {}", job.id);
+        println!("output: {}", String::from_utf8_lossy(&output.stdout));
+        println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+
 
         // Process output
         job.output.stdout = Some(String::from_utf8_lossy(&output.stdout).into());
@@ -139,6 +138,6 @@ impl IsolateExecutor {
         self.redis
             .store_job(&job_id, job, None)
             .await
-            .map_err(|e| JobError::RuntimeError(format!("Failed to update job in Redis: {}", e)))
+            .map_err(|_| JobError::_RuntimeError)
     }
 }

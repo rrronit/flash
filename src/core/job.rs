@@ -1,22 +1,21 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::{sync::atomic::{AtomicUsize, Ordering}, time::{SystemTime, UNIX_EPOCH}};
-use thiserror::Error;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{ExecutionSettings, Language};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
-    pub id: u128,
+    pub id: u64,
     pub source_code: String,
     pub language: Language,
     pub stdin: String,
     pub expected_output: String,
     pub settings: ExecutionSettings,
     pub status: JobStatus,
-    pub created_at: i64, // Unix timestamp in seconds
+    pub created_at: i64,         // Unix timestamp in seconds
     pub started_at: Option<i64>, // Unix timestamp in seconds
-    pub finished_at: Option<i64>, 
+    pub finished_at: Option<i64>,
     pub output: JobOutput,
 }
 
@@ -38,28 +37,22 @@ pub enum JobStatus {
     Failed(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum JobError {
-    #[error("Invalid job configuration")]
-    ConfigurationError,
-    #[error("Execution timeout")]
-    TimeoutError,
-    #[error("Memory limit exceeded")]
-    MemoryLimitExceeded,
-    #[error("Compilation failed: {0}")]
-    CompilationError(String),
-    #[error("Runtime error: {0}")]
-    RuntimeError(String),
+    _ConfigurationError,
+    _TimeoutError,
+    _MemoryLimitExceeded,
+    _CompilationError,
+    _RuntimeError,
 }
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 impl Job {
     pub fn new(source_code: String, language: Language) -> Self {
-        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id = if id > 999 { 1 } else { id }; // Reset to 1 if exceeds 999
-
         Self {
-            id: id as u128,
+            id: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
             source_code,
             language,
             ..Default::default()
@@ -94,7 +87,7 @@ impl Job {
 impl Default for Job {
     fn default() -> Self {
         Self {
-            id: rand::random(),
+            id: 0,
             source_code: String::new(),
             language: Language::default(),
             stdin: String::new(),
@@ -102,10 +95,9 @@ impl Default for Job {
             settings: ExecutionSettings::default(),
             status: JobStatus::Queued,
             created_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH
-            )
-            .unwrap()
-            .as_secs() as i64,
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
             started_at: None,
             finished_at: None,
             output: JobOutput::default(),

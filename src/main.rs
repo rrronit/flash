@@ -16,8 +16,11 @@ async fn main() {
         .expect("Failed to connect to Redis");
 
     // Start the worker
-    let worker = Worker::new(redis_client.clone());
-    worker.start(20).await;
+    let worker_redis = redis_client.clone();
+    tokio::spawn(async move {
+        let worker = Worker::new(worker_redis);
+        worker.start(10).await;
+    });
     
 
     // Start the server

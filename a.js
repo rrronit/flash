@@ -593,38 +593,40 @@ async function checkSubscriptionStatus(sub) {
 			},
 		});
 		const res = await response.json();
-		console.log("Subscription status:", res.status);
 		return res.status;
 	} catch (error) {
 		console.error("Error checking subscription status:", error);
 	}
 }
 
-// Main function to handle subscriptions and checks
-async function main() {
-	const startTime = performance.now(); // Start timing
-	const subs = await Promise.all(
-		Array.from({ length: 500 }, () => createSubscription())
-	);
+// Function to process a batch of subscriptions
+async function processBatch(batchSize) {
+	const batchStartTime = performance.now(); // Start timing for the batch
+	const batch = Array.from({ length: batchSize }, () => createSubscription());
+	const subs = await Promise.all(batch);
 
 	for (const sub of subs) {
-		console.log(`Checking status for subscription ID: ${sub}`);
 		while (true) {
 			const status = await checkSubscriptionStatus(sub);
+			console.log(status)
 			if (status === "Completed" || status === "Failed") {
-				const endTime = performance.now(); // End timing
-				console.log(
-					`Execution finished for ${sub} in ${
-						(endTime - startTime) / 1000
-					} seconds`
-				);
 				break;
 			}
 			await new Promise((resolve) => setTimeout(resolve, 2000)); // 2-second delay
 		}
 	}
-    console.log("All subscriptions completed");
-    console.log("Total time taken:", (performance.now() - startTime) / 1000);
+
+	const batchEndTime = performance.now(); // End timing for the batch
+	console.log(`Batch completed in ${(batchEndTime - batchStartTime) / 1000} seconds`);
+}
+
+// Main function to handle constant batch processing
+async function main() {
+	const batchSize = 50; // Number of concurrent requests
+
+	while (true) {
+		await processBatch(batchSize);
+	}
 }
 
 main();

@@ -1,1 +1,3 @@
 /target
+/src/isolate.rs
+*.py
