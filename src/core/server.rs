@@ -1,6 +1,8 @@
 use crate::{
     client::redis::RedisClient,
-    core::{job::Job, language::Language, settings::ExecutionSettings}, utils::utils::{check_job, create_job}, vendors::debugger,
+    core::{job::Job, language::Language, settings::ExecutionSettings},
+    utils::utils::{check_job, create_job},
+    vendors::debugger,
 };
 use axum::{
     extract::{Json, Path, State},
@@ -34,8 +36,6 @@ async fn handle_create(
     State(redis): State<Arc<RedisClient>>,
     Json(payload): Json<CreateJobRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    println!("Creating job for language: {}", payload.language);
-
     let language = match payload.language.as_str() {
         "python" => Language {
             name: "python".to_string(),
@@ -47,15 +47,22 @@ async fn handle_create(
         "cpp" => Language {
             name: "cpp".to_string(),
             source_file: "main.cpp".to_string(),
-            compile_cmd: Some("/usr/bin/g++ main.cpp -o main".to_string()),
-            run_cmd: "./main".to_string(),
+            compile_cmd: Some("/usr/bin/g++ main.cpp".to_string()),
+            run_cmd: "./a.out".to_string(),
             is_compiled: true,
         },
         "javascript" => Language {
             name: "javascript".to_string(),
             source_file: "main.js".to_string(),
             compile_cmd: None,
-            run_cmd: "node".to_string(),
+            run_cmd: "/usr/bin/node main.js".to_string(),
+            is_compiled: false,
+        },
+        "java" => Language {
+            name: "java".to_string(),
+            source_file: "Main.java".to_string(),
+            compile_cmd: Some("/usr/bin/javac Main.java".to_string()),
+            run_cmd: "/usr/bin/java Main".to_string(),
             is_compiled: false,
         },
         "sql" => Language {
@@ -96,16 +103,34 @@ async fn handle_check(
     State(redis): State<Arc<RedisClient>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    println!("Checking job {}", job_id);
-
     let job = check_job(&redis, &job_id)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    Ok(Json(json!(job)))
+    let send_output = &json!({
+        "stdout": job.output.stdout.unwrap_or("".to_string()),
+        "time": job.output.time.unwrap_or(0.0),
+        "memory": job.output.memory.unwrap_or(0),
+        "stderr": job.output.stderr.unwrap_or("".to_string()),
+        "token": job.id,
+        "compile_output": job.output.compile_output.unwrap_or("".to_string()),
+        "message": job.output.message.unwrap_or("".to_string()),
+        "status": {
+            "id": job.status.id(),
+            "description": format!("{}",job.status),
+        },
+    });
+
+    println!("Job status: {}", send_output);
+
+    Ok(Json(json!(send_output)))
 }
 
-async fn handle_debug(Json(body): Json<debugger::DebugRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let response = debugger::debug(axum::Json(body)).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+async fn handle_debug(
+    Json(body): Json<debugger::DebugRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let response = debugger::debug(axum::Json(body))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!(*response)))
 }

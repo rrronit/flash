@@ -9,8 +9,10 @@ use crate::core::server::server;
 use crate::worker::Worker;
 use tokio;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 20)] 
 async fn main() {
+
+
     // Initialize Redis client
     let redis_client = RedisClient::new("redis://127.0.0.1/")
         .expect("Failed to connect to Redis");
@@ -19,7 +21,7 @@ async fn main() {
     let worker_redis = redis_client.clone();
     tokio::spawn(async move {
         let worker = Worker::new(worker_redis);
-        worker.start(10).await;
+        worker.start(20).await;
     });
     
 

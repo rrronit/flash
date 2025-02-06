@@ -1,68 +1,113 @@
-use redis::{AsyncCommands, RedisResult};
+use bincode;
+use deadpool_redis::{redis, Config, Connection, Pool, Runtime};
+use redis::{AsyncCommands, RedisError, RedisResult};
 use serde::{de::DeserializeOwned, Serialize};
-use std::time::Duration;
-
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct RedisClient {
-    client: redis::Client,
+    pool: Pool,
 }
 
 impl RedisClient {
     pub fn new(redis_url: &str) -> RedisResult<Self> {
-        let client = redis::Client::open(redis_url)?;
-        Ok(Self { client })
+        let cfg = Config::from_url(redis_url);
+        let pool = cfg
+            .create_pool(Some(Runtime::Tokio1))
+            .map_err(|e| RedisError::from((redis::ErrorKind::IoError, "Pool creation error check the url")))?;
+        Ok(Self { pool })
     }
 
-    pub async fn get_connection(&self) -> RedisResult<redis::aio::Connection> {
-        self.client.get_async_connection().await
+    async fn get_conn(&self) -> RedisResult<Connection> {
+        self.pool
+            .get()
+            .await
+            .map_err(|_| RedisError::from((redis::ErrorKind::IoError, "getting connection error")))
     }
 
-    pub async fn store_job<T: Serialize>(&self, key: &str, value: &T, ttl: Option<Duration>) -> RedisResult<()> {
-        let mut conn = self.get_connection().await?;
-        let serialized = serde_json::to_string(value).unwrap(); // Serialize to JSON string
+    pub async fn store_job<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Option<Duration>,
+    ) -> RedisResult<()> {
+        let mut conn = self.get_conn().await?;
+        let serialized = bincode::serialize(value).unwrap();
+
 
         if let Some(ttl) = ttl {
-            conn.set_ex(key, serialized, ttl.as_secs()).await
+            conn.set_ex(key, serialized, ttl.as_secs() as usize).await
         } else {
             conn.set(key, serialized).await
         }
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn get_job<T: DeserializeOwned>(&self, key: &str) -> RedisResult<Option<T>> {
-        let mut conn = self.get_connection().await?;
-        let data: Option<String> = conn.get(key).await?;
-        
-        data.map(|d| serde_json::from_str(&d))
+        let mut conn = self.get_conn().await?;
+        let data: Option<Vec<u8>> = conn.get(key).await?;
+
+        data.map(|d| bincode::deserialize(&d))
             .transpose()
-            .map_err(|e| redis::RedisError::from((redis::ErrorKind::TypeError, "deserialization failed", e.to_string())))
+            .map_err(|e| {
+                redis::RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "deserialization failed",
+                    e.to_string(),
+                ))
+            })
     }
 
     pub async fn enqueue_job<T: Serialize>(&self, queue: &str, value: &T) -> RedisResult<()> {
-        let mut conn = self.get_connection().await?;
-        let serialized = serde_json::to_string(value).unwrap();
+        let mut conn = self.get_conn().await?;
+        let serialized = bincode::serialize(value).unwrap(); // Serialize using bincode
         conn.rpush(queue, serialized).await
     }
 
-    pub async fn get_job_from_queue<T: DeserializeOwned>(&self, queue: &str) -> RedisResult<Option<T>> {
-        let mut conn = self.get_connection().await?;
-        
+    pub async fn get_job_from_queue<T: DeserializeOwned>(
+        &self,
+        queue: &str,
+    ) -> RedisResult<Option<T>> {
+        let mut conn = self.get_conn().await?;
+
         // Use BRPOP with 1-second timeout to block until job arrives
-        let result: Option<(String, String)> = conn.brpop(queue, 1.0).await?;
-    
+        let result: Option<(String, Vec<u8>)> = conn.brpop(queue, 10).await?;
+
         match result {
             Some((_list_name, data)) => {
-                // Deserialize the JSON data
-                let job = serde_json::from_str(&data)
-                    .map_err(|e| redis::RedisError::from((
+                // Deserialize the binary data
+                let job = bincode::deserialize(&data).map_err(|e| {
+                    redis::RedisError::from((
                         redis::ErrorKind::TypeError,
-                        "Job deserialization failed",
-                        e.to_string()
-                    )))?;
-                
+                        "deserialization failed",
+                        e.to_string(),
+                    ))
+                })?;
                 Ok(Some(job))
             }
-            None => Ok(None), 
+            None => {
+                Ok(None)
+            }
         }
+    }
+
+    pub async fn create_job<T: Serialize>(
+        &self,
+        key: &str,
+        queue: &str,
+        value: &T,
+    ) -> RedisResult<()> {
+        let mut conn = self.get_conn().await?;
+        let serialized = bincode::serialize(value).unwrap(); // Serialize using bincode
+
+        // Store the job in Redis and enqueue it
+        redis::pipe()
+            .atomic()
+            .set(key, &serialized)
+            .ignore()
+            .rpush(queue, &serialized)
+            .ignore()
+            .query_async(&mut conn)
+            .await
     }
 }

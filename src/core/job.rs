@@ -1,6 +1,9 @@
-use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+use std::{
+    fmt::Display,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use super::{ExecutionSettings, Language};
 
@@ -13,10 +16,11 @@ pub struct Job {
     pub expected_output: String,
     pub settings: ExecutionSettings,
     pub status: JobStatus,
-    pub created_at: i64,         // Unix timestamp in seconds
-    pub started_at: Option<i64>, // Unix timestamp in seconds
+    pub created_at: i64,         
+    pub started_at: Option<i64>, 
     pub finished_at: Option<i64>,
     pub output: JobOutput,
+    pub number_of_runs: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -27,32 +31,65 @@ pub struct JobOutput {
     pub time: Option<f64>,
     pub memory: Option<u64>,
     pub exit_code: Option<i32>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JobStatus {
     Queued,
     Processing,
-    Completed,
-    Failed(String),
+    Accepted,
+    WrongAnswer,
+    TimeLimitExceeded,
+    CompilationError,
+    RuntimeError(String),
+    InternalError,
+    ExecFormatError,
 }
 
-#[derive(Debug)]
-pub enum JobError {
-    _ConfigurationError,
-    _TimeoutError,
-    _MemoryLimitExceeded,
-    _CompilationError,
-    _RuntimeError,
+impl JobStatus {
+    pub fn id(&self) -> i32 {
+        match self {
+            JobStatus::Queued => 1,
+            JobStatus::Processing => 2,
+            JobStatus::Accepted => 3,
+            JobStatus::WrongAnswer => 4,
+            JobStatus::TimeLimitExceeded => 5,
+            JobStatus::CompilationError => 6,
+            JobStatus::RuntimeError(e) => match e.as_str() {
+                "SIGSEGV" => 7,
+                "SIGXFSZ" => 8,
+                "SIGFPE" => 9,
+                "SIGABRT" => 10,
+                "NZEC" => 11,
+                _ => 12,
+            },
+            JobStatus::InternalError => 13,
+            JobStatus::ExecFormatError => 14,
+        }
+    }
+}
+
+impl Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobStatus::Queued => write!(f, "In Queue"),
+            JobStatus::Processing => write!(f, "Processing"),
+            JobStatus::Accepted => write!(f, "Accepted"),
+            JobStatus::WrongAnswer => write!(f, "Wrong Answer"),
+            JobStatus::TimeLimitExceeded => write!(f, "Time Limit Exceeded"),
+            JobStatus::CompilationError => write!(f, "Compilation Error"),
+            JobStatus::RuntimeError(e) => write!(f, "Runtime Error: ({})", e),
+            JobStatus::InternalError => write!(f, "Internal Error"),
+            JobStatus::ExecFormatError => write!(f, "Exec Format Error"),
+        }
+    }
 }
 
 impl Job {
     pub fn new(source_code: String, language: Language) -> Self {
         Self {
-            id: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
+            id: Uuid::new_v4().as_u128() as u64,
             source_code,
             language,
             ..Default::default()
@@ -101,6 +138,7 @@ impl Default for Job {
             started_at: None,
             finished_at: None,
             output: JobOutput::default(),
+            number_of_runs: 5,
         }
     }
 }
