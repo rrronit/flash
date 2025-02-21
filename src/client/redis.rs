@@ -2,7 +2,7 @@ use bincode;
 use deadpool_redis::{redis, Config, Connection, Pool, Runtime};
 use redis::{AsyncCommands, RedisError, RedisResult};
 use serde::{de::DeserializeOwned, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct RedisClient {
@@ -14,7 +14,7 @@ impl RedisClient {
         let cfg = Config::from_url(redis_url);
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1))
-            .map_err(|e| RedisError::from((redis::ErrorKind::IoError, "Pool creation error check the url")))?;
+            .map_err(|_| RedisError::from((redis::ErrorKind::IoError, "Pool creation error check the url")))?;
         Ok(Self { pool })
     }
 
@@ -58,11 +58,11 @@ impl RedisClient {
             })
     }
 
-    pub async fn enqueue_job<T: Serialize>(&self, queue: &str, value: &T) -> RedisResult<()> {
-        let mut conn = self.get_conn().await?;
-        let serialized = bincode::serialize(value).unwrap(); // Serialize using bincode
-        conn.rpush(queue, serialized).await
-    }
+    // pub async fn enqueue_job<T: Serialize>(&self, queue: &str, value: &T) -> RedisResult<()> {
+    //     let mut conn = self.get_conn().await?;
+    //     let serialized = bincode::serialize(value).unwrap(); // Serialize using bincode
+    //     conn.rpush(queue, serialized).await
+    // }
 
     pub async fn get_job_from_queue<T: DeserializeOwned>(
         &self,

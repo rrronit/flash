@@ -36,6 +36,12 @@ async fn handle_create(
     State(redis): State<Arc<RedisClient>>,
     Json(payload): Json<CreateJobRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // let exact_current_time = std::time::SystemTime::now()
+    //     .duration_since(std::time::UNIX_EPOCH)
+    //     .unwrap()
+    //     .as_micros();
+    // println!("request received at {}", exact_current_time);
+
     let language = match payload.language.as_str() {
         "python" => Language {
             name: "python".to_string(),
@@ -47,7 +53,7 @@ async fn handle_create(
         "cpp" => Language {
             name: "cpp".to_string(),
             source_file: "main.cpp".to_string(),
-            compile_cmd: Some("/usr/bin/g++ main.cpp".to_string()),
+            compile_cmd: Some("/usr/bin/g++ -O0 -Wall -Wextra -Werror -Wpedantic -Wfatal-errors main.cpp".to_string()),
             run_cmd: "./a.out".to_string(),
             is_compiled: true,
         },
@@ -82,6 +88,11 @@ async fn handle_create(
         ..Default::default()
     };
 
+    // let exact_current_time = std::time::SystemTime::now()
+    //     .duration_since(std::time::UNIX_EPOCH)
+    //     .unwrap()
+    //     .as_micros();
+    // println!("job prepared {}", exact_current_time);
     let job = Job::new(payload.code, language)
         .with_stdin(payload.input)
         .with_expected_output(payload.expected)
@@ -108,6 +119,8 @@ async fn handle_check(
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     let send_output = &json!({
+        "started_at": job.started_at.unwrap_or(0),
+        "finished_at": job.finished_at.unwrap_or(0),
         "stdout": job.output.stdout.unwrap_or("".to_string()),
         "time": job.output.time.unwrap_or(0.0),
         "memory": job.output.memory.unwrap_or(0),
@@ -121,7 +134,6 @@ async fn handle_check(
         },
     });
 
-    println!("Job status: {}", send_output);
 
     Ok(Json(json!(send_output)))
 }
@@ -129,8 +141,28 @@ async fn handle_check(
 async fn handle_debug(
     Json(body): Json<debugger::DebugRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let response = debugger::debug(axum::Json(body))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(json!(*response)))
+    println!("debug request received");
+
+  // Simulate a debug response for demonstration purposes
+//   let response = json!({
+//     "status": "success",
+//     "input_received": body.code,
+//     "debug_output": "This is a debug output for input: ".to_string() + &body.input,
+// });
+
+
+let payload = debugger::DebugRequest {
+    code: body.code,
+    input: body.input,
+    language: body.language,
+};
+
+let response2 = match debugger::debug(payload).await {
+    Ok(response) => response,
+    Err(err) => {
+        eprintln!("Debugger error: {:?}", err);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+};
+Ok(Json(json!(*response2)))
 }

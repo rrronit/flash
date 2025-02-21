@@ -22,7 +22,6 @@ impl Worker {
 
         while let Some(Ok(job)) = jobs_stream.next().await {
             let executor = self.isolate_executor.clone();
-
             tokio::spawn(async move {
                 let max_retries = 3;
                 let mut retry_count = 0;
@@ -31,26 +30,33 @@ impl Worker {
                         let result = executor.execute(&mut job).await;
                         match result {
                             Ok(_) => {
-                                println!("Job {} executed successfully", job.id);
+                                cleanup_job(job.id).await;
                                 break;
                             }
-                            Err(e) => {
-                                println!("Job {} failed: {:?}", job.id, e);
+                            Err(_) => {
+                                // println!("Job {} failed: {:?}", job.id, e);
                                 retry_count += 1;
+                                cleanup_job(job.id).await;
                                 if retry_count >= max_retries {
                                     println!("Job {} failed after {} retries", job.id, max_retries);
                                     break;
                                 }
                             }
                         }
-                        let box_id = job.id % 2147483647;
-                        let _ = Command::new("isolate")
-                            .args(&["-b", &box_id.to_string(), "--cleanup"])
-                            .output()
-                            .unwrap();
                     }
                 }
             });
         }
+    }
+}
+
+async fn cleanup_job(job_id: u64) {
+    let box_id = job_id % 2147483647;
+    println!("cleaning {}", box_id);
+    if let Err(e) = Command::new("isolate")
+        .args(&["--cg", "-b", &box_id.to_string(), "--cleanup"])
+        .output()
+    {
+        eprintln!("Failed to cleanup isolate box {}: {:?}", box_id, e);
     }
 }

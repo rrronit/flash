@@ -2,9 +2,10 @@ use crate::{
     client::redis::RedisClient,
     core::{Job, JobStatus},
 };
+use futures::TryFutureExt;
 use redis::RedisError;
 use std::{
-    fs::File,
+    fs::{self, File},
     io::Error,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -41,44 +42,15 @@ impl IsolateExecutor {
         );
 
         // Initialize new box
-        let init_output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("isolate")
-                .args(&["-b", &box_id.to_string(), "--init"])
-                .output()
-        })
-        .await
-        .map_err(|e| format!("Failed to initialize box: {:?}", e))
-        .unwrap()?;
-
-
-        let box_path = String::from_utf8_lossy(&init_output.stdout)
-            .trim()
-            .to_string();
-
-        let file_path = format!("{}/box", box_path);
-        let stdin_file = format!("{}/stdin", file_path);
-        let stdout_file = format!("{}/stdout", file_path);
-        let stderr_file = format!("{}/stderr", file_path);
-        let metadata_file = format!("{}/metadata", file_path);
-
-        // Write source code
-        let source_path = format!("{}/{}", file_path, job.language.source_file);
-
-        tokio::fs::write(&source_path, &job.source_code)    
+        let init_output = Command::new("isolate")
+            .args(&["-b", &box_id.to_string(), "--cg", "--init"])
+            .output()
+            .map_err(|e| format!("Failed to initialize box: {:?}", e))
             .await
-            .expect(format!("Failed to write source code to {}", source_path).as_str());
-        tokio::fs::write(&stdin_file, &job.stdin)
-            .await
-            .expect(format!("Failed to write stdin to {}", stdin_file).as_str());
+            .unwrap();
 
-        let stdin_file =
-            File::open(stdin_file).expect(format!("Failed to open stdin file {}", box_id).as_str());
-        // let mut stdout_file = File::create(stdout_file)
-        //     .expect(format!("Failed to open stdout file {}", box_id).as_str());
-        // let mut stderr_file = File::create(stderr_file)
-        //     .expect(format!("Failed to open stderr file {}", box_id).as_str());
-        File::create(&metadata_file)
-            .expect(format!("Failed to open metadata file {}", box_id).as_str());
+        let (file_path, metadata_file, stdin_file, stdout_file, stderr_file) =
+                self.setup_files(job, &init_output.stdout)?;
 
         // Run compilation if needed
         if let Some(compile_cmd) = &job.language.compile_cmd {
@@ -88,6 +60,7 @@ impl IsolateExecutor {
 
             let compile_status = Command::new("isolate")
                 .args(&[
+                    "--cg",
                     "-b",
                     &box_id.to_string(),
                     "-M",
@@ -103,6 +76,7 @@ impl IsolateExecutor {
                     "12800",
                     "-f",
                     "1024",
+                    format!("--cg-mem={}", job.settings.memory_limit.to_string()).as_str(),
                     "-E",
                     "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"",
                     "-E",
@@ -121,20 +95,13 @@ impl IsolateExecutor {
                     .as_str(),
                 ])
                 .output()
+                .map_err(|e| format!("Failed to run compilation: {:?}", e))
                 .await
-                .expect(format!("Failed to compile job {}", job.id).as_str());
-
-            println!("Compilation status: {:?}", compile_status);
+                .unwrap();
 
             if !compile_status.status.success() {
-                let compile_output =
-                    tokio::fs::read_to_string(format!("{}/compile_output", file_path))
-                        .await
-                        .expect(
-                            format!("Failed to read compile output for job {}", job.id).as_str(),
-                        );
-
-                println!("Compilation error: {}", compile_output);
+                let compile_output = fs::read_to_string(format!("{}/compile_output", file_path))
+                    .expect(format!("Failed to read compile output for job {}", job.id).as_str());
 
                 job.output.compile_output = Some(compile_output);
                 job.status = JobStatus::CompilationError;
@@ -149,6 +116,7 @@ impl IsolateExecutor {
 
         let _ = Command::new("isolate")
             .args(&[
+                "--cg",
                 "-b",
                 &box_id.to_string(),
                 "-M",
@@ -162,6 +130,7 @@ impl IsolateExecutor {
                 "10",
                 "-k",
                 "128000",
+                format!("--cg-mem={}", job.settings.memory_limit.to_string()).as_str(),
                 "-E",
                 "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"",
                 "-E",
@@ -181,23 +150,25 @@ impl IsolateExecutor {
             ])
             .stdin(stdin_file)
             .output()
+            .map_err(|e| format!("Failed to run job: {:?}", e))
             .await
             .unwrap();
 
-        let stdout_content = tokio::fs::read_to_string(&stdout_file).await.unwrap();
-        let stderr_content = tokio::fs::read_to_string(&stderr_file).await.unwrap();
-
+        let stdout_content = fs::read_to_string(&stdout_file).unwrap();
+        let stderr_content = fs::read_to_string(&stderr_file).unwrap();
 
         job.output.stdout = Some(stdout_content);
         job.output.stderr = Some(stderr_content);
 
-        println!("Job finished");
-        println!("output: {:?}", job.output.stdout);
-        println!("stderr: {:?}", job.output.stderr);
-        println!("status: {:?}", job.status);
+        let metadata = match self.get_metadata(box_id) {
+            Ok(meta) => meta,
+            Err(e) => {
+                job.status = JobStatus::InternalError;
+                self.update_job_in_redis(job).await.unwrap();
+                return Ok(JobStatus::InternalError);
+            }
+        };
 
-
-        let metadata = self.get_metadata(box_id).await;
         job.finished_at = Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -206,7 +177,6 @@ impl IsolateExecutor {
                 .try_into()
                 .unwrap(),
         );
-        println!("metadata: {:?}", metadata);
 
         job.output.memory = Some(metadata.memory);
         job.output.time = Some(metadata.time);
@@ -219,10 +189,6 @@ impl IsolateExecutor {
             &job.expected_output,
         );
 
-        // job.output.result =
-        //     Some(self.get_results(&job.output.stdout.clone().unwrap(), &job.expected_output));
-
-        // Update job in Redis
         self.update_job_in_redis(job).await.unwrap();
 
         Ok(job.status.clone())
@@ -230,19 +196,17 @@ impl IsolateExecutor {
 
     async fn update_job_in_redis(&self, job: &Job) -> Result<(), RedisError> {
         let job_id = job.id.to_string();
-        self.redis
-            .store_job(&job_id, job, None)
-            .await
-            .map_err(|_| RedisError::from((redis::ErrorKind::IoError, "Failed to store job")))
+        self.redis.store_job(&job_id, job, None).await.map_err(|_| {
+            RedisError::from((redis::ErrorKind::IoError, "Failed to store job in Redis"))
+        })
     }
 
-    async fn get_metadata(&self, box_id: u64) -> Metadata {
+    fn get_metadata(&self, box_id: u64) -> Result<Metadata,Error> {
         let metadata_file = format!("/var/local/lib/isolate/{}/box/metadata", box_id);
-        let metadata = tokio::fs::read_to_string(metadata_file)
-            .await
+        let metadata = fs::read_to_string(metadata_file)
             .map_err(|_| JobStatus::RuntimeError)
             .map_err(|_| JobStatus::InternalError)
-            .unwrap();
+            .map_err(|_| Error::new(std::io::ErrorKind::Other, "Failed to read metadata"))?;
 
         let lines: Vec<&str> = metadata.lines().collect();
 
@@ -252,7 +216,6 @@ impl IsolateExecutor {
             let value = parts.next().unwrap();
             (key, value)
         });
-
 
         let mut m: Metadata = Metadata {
             time: 0.0,
@@ -265,22 +228,44 @@ impl IsolateExecutor {
         meta.for_each(|f| match f.0 {
             "time" => m.time = f.1.parse().unwrap(),
             "max-rss" => m.memory = f.1.parse().unwrap(),
+            "cg-mem" => m.memory = f.1.parse().unwrap(),
             "exitcode" => m.exit_code = f.1.parse().unwrap(),
             "message" => m.message = f.1.to_string(),
             "status" => m.status = f.1.to_string(),
             _ => {}
         });
 
-        m
+        Ok(m)
     }
 
-    // fn get_results(&self, expected: &String, output: &String) -> {
-    //     if expected == output {
-    //         JobResult::Accepted
-    //     } else {
-    //         JobResult::WrongAnswer
-    //     }
-    // }
+    fn setup_files(
+        self: &Self,
+        job: &Job,
+        stdout: &[u8],
+    ) -> Result<(String, String, File, String, String), Error> {
+        let box_path = String::from_utf8_lossy(&stdout).trim().to_string();
+        let file_path = format!("{}/box", box_path);
+        let stdin_file = format!("{}/stdin", file_path);
+        let stdout_file = format!("{}/stdout", file_path);
+        let stderr_file = format!("{}/stderr", file_path);
+        let metadata_file = format!("{}/metadata", file_path);
+
+        // Write source code
+        let source_path = format!("{}/{}", file_path, job.language.source_file);
+
+        fs::write(&source_path, &job.source_code)?;
+        fs::write(&stdin_file, &job.stdin)?;
+
+        let stdin_file = File::open(stdin_file)?;
+
+        Ok((
+            file_path,
+            metadata_file,
+            stdin_file,
+            stdout_file,
+            stderr_file,
+        ))
+    }
 }
 
 fn determine_status(

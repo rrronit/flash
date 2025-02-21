@@ -732,74 +732,155 @@ TestCase-103
 
 
 const data = {
-	code: jsCode,
-	language: "javascript",
-	input: stdin,
-	expected,
-	time_limit: 1,
-	memory_limit: 160000,
-	stack_limit: 16000,
+    code: java_code,
+    language: "java",
+    input: stdin,
+    expected,
+    time_limit: 1,
+    memory_limit: 160000,
+    stack_limit: 16000,
 };
 
 // Create a subscription
 async function createSubscription() {
-	try {
-		const response = await fetch("http://localhost:3001/create", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify(data),
-		});
-		const res = await response.json();
-		return res.id;
-	} catch (error) {
-		console.error("Error creating subscription:", error);
-	}
+    try {
+        const response = await fetch("http://localhost:3001/create", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(data),
+        });
+        const res = await response.json();
+        return { id: res.id, startTime: performance.now() }; // Store start time for tracking
+    } catch (error) {
+        console.error("Error creating subscription:", error);
+    }
 }
 
 // Check subscription status
 async function checkSubscriptionStatus(sub) {
-	try {
-		const response = await fetch(`http://localhost:3001/check/${sub}`, {
-			method: "GET",
-			headers: {
-				"Content-Type": "application/json",
-			},
-		});
-		const res = await response.json();
-		return res;
-	} catch (error) {
-		console.error("Error checking subscription status:", error);
-	}
+    try {
+        const response = await fetch(`http://localhost:3001/check/${sub.id}`, {
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+        });
+        const res = await response.json();
+        return res;
+    } catch (error) {
+        console.error("Error checking subscription status:", error);
+    }
 }
 
-// Function to process a batch of subscriptions
+// Function to process a batch of submissions
 async function processBatch(batchSize) {
-	const batchStartTime = performance.now(); // Start timing for the batch
-	const batch = Array.from({ length: batchSize }, () => createSubscription());
-	const subs = await Promise.all(batch);
+    console.log(`\nStarting batch with ${batchSize} items...`);
 
-	for (const sub of subs) {
-		while (true) {
-			const job = await checkSubscriptionStatus(sub);
-			if (job.status.description !== "In Queue") {
-				console.log(job.status.description);
-				break;
-			}
-		}
-	}
+    const batchStartTime = performance.now();
+    const subs = await Promise.all(Array.from({ length: batchSize }, createSubscription));
 
-	const batchEndTime = performance.now(); // End timing for the batch
-	console.log(`Batch completed in ${(batchEndTime - batchStartTime) / 1000} seconds`);
+    let completed = new Set();
+    let submissionTimes = {}; // Store execution times per submission
+
+    while (completed.size < batchSize) {
+        for (const sub of subs) {
+            if (!completed.has(sub.id)) {
+                const job = await checkSubscriptionStatus(sub);
+                if (job.status.description !== "In Queue") {
+                    const endTime = performance.now();
+                    const executionTime = (endTime - sub.startTime) / 1000;
+                    submissionTimes[sub.id] = executionTime; // Store execution time
+                    completed.add(sub.id);
+                }
+            }
+        }
+        console.log(`${completed.size}/${batchSize} completed`);
+    }
+
+    const batchEndTime = performance.now();
+    const batchTime = (batchEndTime - batchStartTime) / 1000;
+
+    // Calculate stats
+    const executionTimes = Object.values(submissionTimes);
+    const minTime = Math.min(...executionTimes);
+    const maxTime = Math.max(...executionTimes);
+    const avgTime = executionTimes.reduce((sum, t) => sum + t, 0) / executionTimes.length;
+
+    console.log(`Batch of ${batchSize} completed in ${batchTime.toFixed(2)} seconds`);
+    console.log(`Min execution time: ${minTime.toFixed(5)} sec`);
+    console.log(`Max execution time: ${maxTime.toFixed(5)} sec`);
+    console.log(`Avg execution time: ${avgTime.toFixed(5)} sec`);
+
+    return { batchSize, batchTime, minTime, maxTime, avgTime };
 }
 
+// Main function to test multiple batch sizes
 async function main() {
-	const batchSize = 5
+    const batchSizes = [1, 5, 10];
+    let results = [];
 
-	while (true) {
-		await processBatch(batchSize);
-	}
+    for (const batchSize of batchSizes) {
+        const result = await processBatch(batchSize);
+        results.push(result);
+    }
+
+    console.log("\nBenchmark Results:");
+    console.table(results);
 }
 
 main();
+
+
+
+//no box pool js ->  0.07862636 seconds
+//no box pool java -> 0.40972607 seconds
+//no box pool cpp ->  0.8886603 seconds
+//no box pool python -> 0.03532750 seconds
+
+
+// box pool js ->  0.07186603 seconds
+// box pool java -> 0.35972607 seconds
+// box pool cpp ->  0.7186603 seconds 
+// box pool python -> 0.03473804 seconds
+
+
+
+
+// Benchmark Results:
+// ┌─────────┬───────────┬─────────────────────┬───────────────────────┬───────────────────────┬───────────────────────┐
+// │ (index) │ batchSize │ batchTime           │ minTime               │ maxTime               │ avgTime               │
+// ├─────────┼───────────┼─────────────────────┼───────────────────────┼───────────────────────┼───────────────────────┤
+// │ 0       │ 1         │ 0.38822857099999997 │ 0.0034818599999999833 │ 0.0034818599999999833 │ 0.0034818599999999833 │
+// │ 1       │ 5         │ 0.6968911360000002  │ 0.664995212           │ 0.6888419819999999    │ 0.6774739702000001    │
+// │ 2       │ 10        │ 1.0896771990000003  │ 0.883525079           │ 1.0754827770000002    │ 1.0302021966          │
+// │ 3       │ 20        │ 1.8916744539999995  │ 1.5854036629999997    │ 1.8749627170000003    │ 1.74720097635         │
+// │ 4       │ 50        │ 4.858744141000001   │ 2.049934244           │ 3.8189675579999993    │ 2.9762772903999997    │
+// │ 5       │ 100       │ 9.413686301         │ 4.873416345000002     │ 8.708144413000001     │ 7.301396924110001     │
+// │ 6       │ 200       │ 20.28325489         │ 3.4884826040000005    │ 19.856012273          │ 19.012410798085003    │
+// └─────────┴───────────┴─────────────────────┴───────────────────────┴───────────────────────┴───────────────────────┘
+
+
+// Benchmark Results: with async Command
+// ┌─────────┬───────────┬─────────────────────┬───────────────────────┬───────────────────────┬───────────────────────┐
+// │ (index) │ batchSize │ batchTime           │ minTime               │ maxTime               │ avgTime               │
+// ├─────────┼───────────┼─────────────────────┼───────────────────────┼───────────────────────┼───────────────────────┤
+// │ 0       │ 1         │ 0.40136242299999997 │ 0.0032090129999999702 │ 0.0032090129999999702 │ 0.0032090129999999702 │
+// │ 1       │ 5         │ 0.9718184009999999  │ 0.003815437999999972  │ 0.6163805269999999    │ 0.4773169562          │
+// │ 2       │ 10        │ 1.111524214         │ 0.9480980640000001    │ 1.101279811           │ 1.0578401142          │
+// │ 3       │ 20        │ 2.322284612         │ 0.007127416999999696  │ 1.96518368            │ 1.70771859705         │
+// │ 4       │ 50        │ 4.801648015         │ 2.079913237           │ 3.7849286039999996    │ 2.9457884993200003    │
+// │ 5       │ 100       │ 9.416436357999999   │ 3.8177407189999992    │ 9.248642494           │ 6.9694272940600035    │
+// │ 6       │ 200       │ 18.909683378000004  │ 6.577229220999998     │ 17.667689172000003    │ 15.135962912940002    │
+// └─────────┴───────────┴─────────────────────┴───────────────────────┴───────────────────────┴───────────────────────┘
+
+
+// Benchmark Results:
+// ┌─────────┬───────────┬─────────────────────┬────────────────────┬────────────────────┬────────────────────┐
+// │ (index) │ batchSize │ batchTime           │ minTime            │ maxTime            │ avgTime            │
+// ├─────────┼───────────┼─────────────────────┼────────────────────┼────────────────────┼────────────────────┤
+// │ 0       │ 1         │ 0.47198826199999994 │ 0.423468856        │ 0.423468856        │ 0.423468856        │
+// │ 1       │ 5         │ 0.6930421600000001  │ 0.6294909520000002 │ 0.686258702        │ 0.6536879556       │
+// │ 2       │ 10        │ 1.1036043050000002  │ 0.9300072039999998 │ 1.0959709219999998 │ 1.0364192316999996 │
+// │ 3       │ 20        │ 1.986463447         │ 1.6489298740000005 │ 1.9724271189999996 │ 1.8634631091500005 │
+// │ 4       │ 50        │ 5.104834258         │ 3.7948678549999997 │ 5.065155109        │ 4.713057229080001  │
+// │ 5       │ 100       │ 9.856603473000002   │ 3.957500817        │ 9.771785607        │ 8.90954378256      │
+// │ 6       │ 200       │ 11.312671159999997  │ 10.674545425       │ 11.260640411       │ 11.119756015995    │
+// └─────────┴───────────┴─────────────────────┴────────────────────┴────────────────────┴────────────────────┘

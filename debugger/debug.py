@@ -4,15 +4,24 @@ import bdb
 import io
 from contextlib import redirect_stdout
 import types
+import os
 
 class Debugger(bdb.Bdb):
-    def __init__(self):
+    def __init__(self, user_code_length: int):
         super().__init__()
         self.steps = []
         self.stdout_capture = io.StringIO()
         self.current_stdout = ""
+        self.user_code_length = user_code_length
         
     def user_line(self, frame):
+        # Skip debugger internals or non-user code
+        if (
+            frame.f_code.co_filename != os.path.abspath("debugger/temp.py")  # Skip non-user files
+            or frame.f_lineno > self.user_code_length  # Skip lines beyond user code
+        ):
+            return
+
         # Get the current line of code
         filename = frame.f_code.co_filename
         line_no = frame.f_lineno
@@ -22,13 +31,14 @@ class Debugger(bdb.Bdb):
             lines = f.readlines()
             current_line = lines[line_no - 1].strip()
         
-        # Get local variables
+        # Get local variables (filter out debugger internals)
         locals_dict = {
             key: value for key, value in frame.f_locals.items()
-            if not key.startswith('__') and not isinstance(value, (type, types.ModuleType, types.FunctionType))
+            if not key.startswith('__') 
+            and not isinstance(value, (type, types.ModuleType, types.FunctionType))
         }
         
-        # Capture any new stdout content
+        # Capture stdout
         new_stdout = self.stdout_capture.getvalue()[len(self.current_stdout):]
         self.current_stdout = self.stdout_capture.getvalue()
         
@@ -39,42 +49,34 @@ class Debugger(bdb.Bdb):
             "locals": sanitize_dict(locals_dict),
             "stdout": new_stdout
         })
-        
+
 def sanitize_dict(d):
-    """Sanitize a dictionary to make it JSON serializable."""
+    """Sanitize to remove non-serializable values."""
     sanitized = {}
     for key, value in d.items():
-        if key.startswith('__'):
-            continue
-        if isinstance(value, (types.ModuleType, types.FunctionType, types.BuiltinFunctionType)):
-            continue
-        elif isinstance(value, (int, float, str, bool, list, dict, tuple, type(None))):
+        if isinstance(value, (int, float, str, bool, list, dict, type(None))):
             sanitized[key] = value
         else:
-            try:
-                sanitized[key] = str(value)
-            except:
-                continue
+            sanitized[key] = str(value)
     return sanitized
 
-
 def debug_file(filename):
-    debugger = Debugger()
+    # First, get the length of the user's code
+    with open(filename, 'r') as f:
+        user_code = f.read()
+        user_code_length = len(user_code.splitlines())
+
+    debugger = Debugger(user_code_length)
     
-    # Redirect stdout to capture print statements
     with redirect_stdout(debugger.stdout_capture):
         try:
-            # Run the file under the debugger
             with open(filename, 'r') as f:
                 code = compile(f.read(), filename, 'exec')
                 debugger.run(code)
         except:
-            pass  # Ignore any errors in the target file
-    
-    # Return the collected debug information
-    return {
-        "steps": debugger.steps
-    }
+            pass  # Ignore errors in user code
+
+    return {"steps": debugger.steps}
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
