@@ -1,0 +1,1742 @@
+=== .\src\isolate.rs ===
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
+use nix::{
+    mount::{mount, umount2, MntFlags, MsFlags},
+    sched::{unshare, CloneFlags},
+    sys::{
+        resource::Resource,
+        signal::{self, Signal},
+        wait,
+    },
+    unistd::{self, Gid, Uid},
+};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+// Configuration structure
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub box_id: u32,
+    pub cg_enabled: bool,
+    pub memory_limit: u64,
+    pub time_limit: Duration,
+    pub wall_time_limit: Duration,
+    pub fsize_limit: u64,
+    pub stack_limit: u64,
+    pub open_files: u64,
+    pub processes_limit: u64,
+    pub share_net: bool,
+    pub meta_file: Option<PathBuf>,
+    pub work_dir: PathBuf,
+    pub cg_root: PathBuf,
+    pub uid_map: (u32, u32),
+    pub gid_map: (u32, u32),
+}
+
+impl Config {
+    pub fn new(box_id: u32, cg_enabled: bool) -> Result<Self> {
+        let work_dir = PathBuf::from("/var/isolate").join(box_id.to_string());
+        let cg_root = PathBuf::from("/sys/fs/cgroup");
+
+        Ok(Self {
+            box_id,
+            cg_enabled,
+            memory_limit: 0,
+            time_limit: Duration::ZERO,
+            wall_time_limit: Duration::ZERO,
+            fsize_limit: 0,
+            stack_limit: 0,
+            open_files: 64,
+            processes_limit: 1,
+            share_net: false,
+            meta_file: None,
+            work_dir,
+            cg_root,
+            uid_map: (100000, 65536),
+            gid_map: (100000, 65536),
+        })
+    }
+}
+
+// CLI structure
+#[derive(Parser, Clone)]
+#[clap(version, about)]
+pub struct Cli {
+    #[clap(long)]
+    box_id: u32,
+    #[clap(long)]
+    cg: bool,
+    #[clap(long)]
+    mem: Option<u64>,
+    #[clap(long)]
+    time: Option<f64>,
+    #[clap(long)]
+    wall_time: Option<f64>,
+    #[clap(subcommand)]
+    command: IsolateCommand,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum IsolateCommand {
+    Init,
+    Run { command: Vec<String> },
+    Cleanup,
+    Stats,
+}
+
+// Resource tracker
+#[derive(Debug, Clone)]
+pub struct ResourceTracker {
+    start_time: Instant,
+    time_limit: Duration,
+    wall_time_limit: Duration,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl ResourceTracker {
+    pub fn new(time_limit: Duration, wall_time_limit: Duration) -> Self {
+        Self {
+            start_time: Instant::now(),
+            time_limit,
+            wall_time_limit,
+            interrupted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn setup_signals(&self) -> Result<()> {
+        let interrupted = self.interrupted.clone();
+
+        signal::signal(Signal::SIGINT, move |_| {
+            interrupted.store(true, Ordering::Relaxed);
+        })?;
+
+        signal::signal(Signal::SIGTERM, move |_| {
+            interrupted.store(true, Ordering::Relaxed);
+        })?;
+
+        Ok(())
+    }
+
+    pub fn check_limits(&self) -> Result<()> {
+        if self.interrupted.load(Ordering::Relaxed) {
+            return Err(anyhow!("Process interrupted by signal"));
+        }
+
+        let wall_elapsed = self.start_time.elapsed();
+        if wall_elapsed > self.wall_time_limit {
+            return Err(anyhow!("Wall time limit exceeded"));
+        }
+
+        Ok(())
+    }
+}
+
+// Cgroup manager
+#[derive(Debug, Clone)]
+pub struct CgroupManager {
+    path: PathBuf,
+}
+
+impl CgroupManager {
+    pub fn new(config: &Config) -> Result<Self> {
+        let path = config
+            .cg_root
+            .join("isolate")
+            .join(config.box_id.to_string());
+
+        fs::create_dir_all(&path)
+            .with_context(|| format!("Failed to create cgroup at {:?}", path))?;
+
+        Ok(Self { path })
+    }
+
+    pub fn apply_limits(&self, config: &Config) -> Result<()> {
+        if config.memory_limit > 0 {
+            self.write_file("memory.max", config.memory_limit.to_string())?;
+        }
+
+        if config.processes_limit > 0 {
+            self.write_file("pids.max", config.processes_limit.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    pub fn add_process(&self, pid: u32) -> Result<()> {
+        self.write_file("cgroup.procs", pid.to_string())
+    }
+
+    pub fn write_file(&self, file: &str, content: String) -> Result<()> {
+        let path = self.path.join(file);
+        fs::write(path, content).with_context(|| format!("Failed to write cgroup file {:?}", file))
+    }
+}
+
+impl Drop for CgroupManager {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+// Filesystem isolation
+#[derive(Debug, Clone)]
+pub struct SandboxFS {
+    root: PathBuf,
+}
+
+impl SandboxFS {
+    pub fn new(config: &Config) -> Result<Self> {
+        let root = &config.work_dir;
+
+        // Create root filesystem
+        fs::create_dir_all(root.join("root"))?;
+        mount::<_, str, str, str>(
+            Some("tmpfs"),
+            root.join("root").to_str().unwrap(),
+            Some("tmpfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )?;
+
+        // Mount proc filesystem
+        fs::create_dir_all(root.join("root/proc"))?;
+        mount::<_, str, str, str>(
+            Some("proc"),
+            root.join("root/proc").to_str().unwrap(),
+            Some("proc"),
+            MsFlags::empty(),
+            None::<&str>,
+        )?;
+
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    pub fn chroot(&self) -> Result<()> {
+        unistd::chroot(self.root.join("root").to_str().unwrap())?;
+        unistd::chdir("box")?;
+        Ok(())
+    }
+}
+
+impl Drop for SandboxFS {
+    fn drop(&mut self) {
+        let _ = umount2(
+            self.root.join("root/proc").to_str().unwrap(),
+            MntFlags::MNT_DETACH,
+        );
+        let _ = umount2(
+            self.root.join("root").to_str().unwrap(),
+            MntFlags::MNT_DETACH,
+        );
+    }
+}
+
+// Main isolation logic
+#[derive(Debug, Clone)]
+pub struct Isolator {
+    config: Config,
+    cgroup: Option<CgroupManager>,
+    fs: SandboxFS,
+}
+
+impl Isolator {
+    pub fn new(config: Config) -> Result<Self> {
+        let cgroup = if config.cg_enabled {
+            Some(CgroupManager::new(&config)?)
+        } else {
+            None
+        };
+
+        let fs = SandboxFS::new(&config)?;
+
+        Ok(Self { config, cgroup, fs })
+    }
+    pub fn work_dir(&self) -> &PathBuf {
+        &self.config.work_dir
+    }
+
+    pub fn run_command(&self, command: &[String]) -> Result<ExitStatus> {
+        // Setup namespaces
+        let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
+        if !self.config.share_net {
+            flags |= CloneFlags::CLONE_NEWNET;
+        }
+
+        unshare(flags)?;
+
+        // Setup cgroups
+        if let Some(cg) = &self.cgroup {
+            cg.apply_limits(&self.config)?;
+        }
+
+        // Enter chroot
+        self.fs.chroot()?;
+
+        // Drop privileges
+        self.set_credentials()?;
+
+        // Execute command
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..]);
+
+        let status = cmd.status()?;
+        Ok(status)
+    }
+
+    pub fn set_credentials(&self) -> Result<()> {
+        let (uid, gid) = (self.config.uid_map.0, self.config.gid_map.0);
+
+        unistd::setresgid(Gid::from_raw(gid), Gid::from_raw(gid), Gid::from_raw(gid))?;
+        unistd::setgroups(&[])?;
+        unistd::setresuid(Uid::from_raw(uid), Uid::from_raw(uid), Uid::from_raw(uid))?;
+
+        Ok(())
+    }
+    pub fn run_command_with_io(
+        &self,
+        command: &[&str],
+        stdin_path: &Path,
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) -> Result<std::process::Output> {
+        let stdin_file = std::fs::File::open(stdin_path)?;
+        let stdout_file = std::fs::File::create(stdout_path)?;
+        let stderr_file = std::fs::File::create(stderr_path)?;
+
+        let mut cmd = std::process::Command::new(command[0]);
+        cmd.args(&command[1..])
+            .stdin(std::process::Stdio::from(stdin_file))
+            .stdout(std::process::Stdio::from(stdout_file))
+            .stderr(std::process::Stdio::from(stderr_file));
+
+        let output = cmd.output()?;
+        Ok(output)
+    }
+}
+
+// Public API
+// pub fn init_sandbox(config: &Config) -> Result<()> {
+//     fs::create_dir_all(&config.work_dir)?;
+//     if config.cg_enabled {
+//         CgroupManager::new(config)?;
+//     }
+//     Ok(())
+// }
+
+// pub fn run_command(config: &Config, command: &[String]) -> Result<()> {
+//     let tracker = ResourceTracker::new(config.time_limit, config.wall_time_limit);
+//     tracker.setup_signals()?;
+
+//     let isolator = Isolator::new(config.clone())?;
+//     let status = isolator.run_command(command)?;
+
+//     if !status.success() {
+//         return Err(anyhow!(
+//             "Command failed with exit code: {}",
+//             status.code().unwrap_or(-1)
+//         ));
+//     }
+
+//     Ok(())
+// }
+
+// pub fn cleanup_sandbox(config: &Config) -> Result<()> {
+//     if config.work_dir.exists() {
+//         fs::remove_dir_all(&config.work_dir)?;
+//     }
+//     Ok(())
+// }
+
+// pub fn show_stats(_config: &Config) -> Result<()> {
+//     // Implement statistics collection from cgroups/procfs
+//     Ok(())
+// }
+
+
+=== .\src\lib.rs ===
+pub mod client;
+pub mod core;
+pub mod vendors;
+pub mod utils;
+// pub mod isolate;
+
+
+=== .\src\main.rs ===
+mod client;
+mod core;
+mod utils;
+mod vendors;
+mod worker;
+
+use crate::client::redis::RedisClient;
+use crate::core::server::server;
+use crate::worker::Worker;
+use tokio;
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 20)] 
+async fn main() {
+
+
+    // Initialize Redis client
+    let redis_client = RedisClient::new("redis://127.0.0.1/")
+        .expect("Failed to connect to Redis");
+
+    // Start the worker
+    let worker_redis = redis_client.clone();
+    tokio::spawn(async move {
+        let worker = Worker::new(worker_redis);
+        worker.start(20).await;
+    });
+    
+
+    // Start the server
+    let app = server(redis_client);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001")
+        .await
+        .unwrap();
+
+    println!("Server running on http://0.0.0.0:3001");
+    axum::serve(listener, app).await.unwrap();
+}
+
+=== .\src\client\mod.rs ===
+pub mod redis;
+
+
+=== .\src\client\redis.rs ===
+use bincode;
+use deadpool_redis::{redis, Config, Connection, Pool, Runtime};
+use redis::{AsyncCommands, RedisError, RedisResult};
+use serde::{de::DeserializeOwned, Serialize};
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct RedisClient {
+    pool: Pool,
+}
+
+impl RedisClient {
+    pub fn new(redis_url: &str) -> RedisResult<Self> {
+        let cfg = Config::from_url(redis_url);
+        let pool = cfg
+            .create_pool(Some(Runtime::Tokio1))
+            .map_err(|_| RedisError::from((redis::ErrorKind::IoError, "Pool creation error check the url")))?;
+        Ok(Self { pool })
+    }
+
+    async fn get_conn(&self) -> RedisResult<Connection> {
+        self.pool
+            .get()
+            .await
+            .map_err(|_| RedisError::from((redis::ErrorKind::IoError, "getting connection error")))
+    }
+
+    pub async fn store_job<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Option<Duration>,
+    ) -> RedisResult<()> {
+        let mut conn = self.get_conn().await?;
+        let serialized = bincode::serialize(value).unwrap();
+
+
+        if let Some(ttl) = ttl {
+            conn.set_ex(key, serialized, ttl.as_secs() as usize).await
+        } else {
+            conn.set(key, serialized).await
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn get_job<T: DeserializeOwned>(&self, key: &str) -> RedisResult<Option<T>> {
+        let mut conn = self.get_conn().await?;
+        let data: Option<Vec<u8>> = conn.get(key).await?;
+
+        data.map(|d| bincode::deserialize(&d))
+            .transpose()
+            .map_err(|e| {
+                redis::RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "deserialization failed",
+                    e.to_string(),
+                ))
+            })
+    }
+
+    // pub async fn enqueue_job<T: Serialize>(&self, queue: &str, value: &T) -> RedisResult<()> {
+    //     let mut conn = self.get_conn().await?;
+    //     let serialized = bincode::serialize(value).unwrap(); // Serialize using bincode
+    //     conn.rpush(queue, serialized).await
+    // }
+
+    pub async fn get_job_from_queue<T: DeserializeOwned>(
+        &self,
+        queue: &str,
+    ) -> RedisResult<Option<T>> {
+        let mut conn = self.get_conn().await?;
+
+        // Use BRPOP with 1-second timeout to block until job arrives
+        let result: Option<(String, Vec<u8>)> = conn.brpop(queue, 10).await?;
+
+        match result {
+            Some((_list_name, data)) => {
+                // Deserialize the binary data
+                let job = bincode::deserialize(&data).map_err(|e| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "deserialization failed",
+                        e.to_string(),
+                    ))
+                })?;
+                Ok(Some(job))
+            }
+            None => {
+                Ok(None)
+            }
+        }
+    }
+
+    pub async fn create_job<T: Serialize>(
+        &self,
+        key: &str,
+        queue: &str,
+        value: &T,
+    ) -> RedisResult<()> {
+        let mut conn = self.get_conn().await?;
+        let serialized = bincode::serialize(value).unwrap(); // Serialize using bincode
+
+        // Store the job in Redis and enqueue it
+        redis::pipe()
+            .atomic()
+            .set(key, &serialized)
+            .ignore()
+            .rpush(queue, &serialized)
+            .ignore()
+            .query_async(&mut conn)
+            .await
+    }
+}
+
+
+=== .\src\core\job.rs ===
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use std::{
+    fmt::Display,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use super::{ExecutionSettings, Language};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Job {
+    pub id: u64,
+    pub source_code: String,
+    pub language: Language,
+    pub stdin: String,
+    pub expected_output: String,
+    pub settings: ExecutionSettings,
+    pub status: JobStatus,
+    pub created_at: i64,         
+    pub started_at: Option<i64>, 
+    pub finished_at: Option<i64>,
+    pub output: JobOutput,
+    pub number_of_runs: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JobOutput {
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub compile_output: Option<String>,
+    pub time: Option<f64>,
+    pub memory: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JobStatus {
+    Queued,
+    Processing,
+    Accepted,
+    WrongAnswer,
+    TimeLimitExceeded,
+    CompilationError,
+    RuntimeError(String),
+    InternalError,
+    ExecFormatError,
+}
+
+impl JobStatus {
+    pub fn id(&self) -> i32 {
+        match self {
+            JobStatus::Queued => 1,
+            JobStatus::Processing => 2,
+            JobStatus::Accepted => 3,
+            JobStatus::WrongAnswer => 4,
+            JobStatus::TimeLimitExceeded => 5,
+            JobStatus::CompilationError => 6,
+            JobStatus::RuntimeError(e) => match e.as_str() {
+                "SIGSEGV" => 7,
+                "SIGXFSZ" => 8,
+                "SIGFPE" => 9,
+                "SIGABRT" => 10,
+                "NZEC" => 11,
+                _ => 12,
+            },
+            JobStatus::InternalError => 13,
+            JobStatus::ExecFormatError => 14,
+        }
+    }
+}
+
+impl Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobStatus::Queued => write!(f, "In Queue"),
+            JobStatus::Processing => write!(f, "Processing"),
+            JobStatus::Accepted => write!(f, "Accepted"),
+            JobStatus::WrongAnswer => write!(f, "Wrong Answer"),
+            JobStatus::TimeLimitExceeded => write!(f, "Time Limit Exceeded"),
+            JobStatus::CompilationError => write!(f, "Compilation Error"),
+            JobStatus::RuntimeError(e) => write!(f, "Runtime Error: ({})", e),
+            JobStatus::InternalError => write!(f, "Internal Error"),
+            JobStatus::ExecFormatError => write!(f, "Exec Format Error"),
+        }
+    }
+}
+
+impl Job {
+    pub fn new(source_code: String, language: Language) -> Self {
+        Self {
+            id: Uuid::new_v4().as_u128() as u64,
+            source_code,
+            language,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_stdin(mut self, stdin: String) -> Self {
+        self.stdin = stdin;
+        self
+    }
+
+    pub fn with_expected_output(mut self, expected_output: String) -> Self {
+        self.expected_output = expected_output;
+        self
+    }
+
+    pub fn set_limits(
+        mut self,
+        cpu_time_limit: f64,
+        memory_limit: u64,
+        stack_limit: u64,
+        max_processes: u32,
+    ) -> Self {
+        self.settings.cpu_time_limit = cpu_time_limit;
+        self.settings.memory_limit = memory_limit;
+        self.settings.stack_limit = stack_limit;
+        self.settings.max_processes = max_processes;
+        self
+    }
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            source_code: String::new(),
+            language: Language::default(),
+            stdin: String::new(),
+            expected_output: String::new(),
+            settings: ExecutionSettings::default(),
+            status: JobStatus::Queued,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            started_at: None,
+            finished_at: None,
+            output: JobOutput::default(),
+            number_of_runs: 5,
+        }
+    }
+}
+
+
+=== .\src\core\language.rs ===
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Language {
+    pub name: String,
+    pub source_file: String,
+    pub compile_cmd: Option<String>,
+    pub run_cmd: String,
+    pub is_compiled: bool,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Self {
+            name: "python".to_string(),
+            source_file: "main.py".to_string(),
+            compile_cmd: None,
+            run_cmd: "/usr/bin/python3 main.py".to_string(),
+            is_compiled: false,
+        }
+    }
+}
+
+=== .\src\core\mod.rs ===
+pub mod job;
+pub mod language;
+pub mod settings;
+pub mod server;
+
+pub use job::*;
+pub use language::*;
+pub use settings::*;
+
+=== .\src\core\pool.rs ===
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+use thiserror::Error;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Job {
+    pub id: u128,
+    pub source_code: String,
+    pub language: Language,
+    pub stdin: String,
+    pub expected_output: String,
+    pub settings: ExecutionSettings,
+    pub status: JobStatus,
+    pub created_at: SystemTime,
+    pub started_at: Option<SystemTime>,
+    pub finished_at: Option<SystemTime>,
+    pub output: JobOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobOutput {
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub compile_output: Option<String>,
+    pub time: Option<f64>,
+    pub memory: Option<u64>,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JobStatus {
+    Queued,
+    Processing,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Error, Debug)]
+pub enum JobError {
+    #[error("Invalid job configuration")]
+    ConfigurationError,
+    #[error("Execution timeout")]
+    TimeoutError,
+    #[error("Memory limit exceeded")]
+    MemoryLimitExceeded,
+    #[error("Compilation failed: {0}")]
+    CompilationError(String),
+    #[error("Runtime error: {0}")]
+    RuntimeError(String),
+}
+
+
+impl Job {
+    pub fn new(source_code: String, language: Language) -> Self {
+        Self {
+            id: rand::random(),
+            source_code,
+            language,
+            ..Default::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), JobError> {
+        if self.source_code.is_empty() {
+            return Err(JobError::ConfigurationError);
+        }
+        Ok(())
+    }
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Self {
+            id: rand::random(),
+            source_code: String::new(),
+            language: Language::default(),
+            stdin: String::new(),
+            expected_output: String::new(),
+            settings: ExecutionSettings::default(),
+            status: JobStatus::Queued,
+            created_at: SystemTime::now(),
+            started_at: None,
+            finished_at: None,
+            output: JobOutput::default(),
+        }
+    }
+}
+
+=== .\src\core\server.rs ===
+use crate::{
+    client::redis::RedisClient,
+    core::{job::Job, language::Language, settings::ExecutionSettings},
+    utils::utils::{check_job, create_job},
+    vendors::debugger,
+};
+use axum::{
+    extract::{Json, Path, State},
+    http::StatusCode,
+    routing::{get, post},
+    Router,
+};
+use serde_json::json;
+use std::sync::Arc;
+
+pub fn server(redis_client: RedisClient) -> Router {
+    Router::new()
+        .route("/create", post(handle_create))
+        .route("/check/:job_id", get(handle_check))
+        .route("/debug", post(handle_debug))
+        .with_state(Arc::new(redis_client))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateJobRequest {
+    code: String,
+    language: String,
+    input: String,
+    expected: String,
+    time_limit: Option<f64>,
+    memory_limit: Option<u64>,
+    stack_limit: Option<u64>,
+}
+
+async fn handle_create(
+    State(redis): State<Arc<RedisClient>>,
+    Json(payload): Json<CreateJobRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // let exact_current_time = std::time::SystemTime::now()
+    //     .duration_since(std::time::UNIX_EPOCH)
+    //     .unwrap()
+    //     .as_micros();
+    // println!("request received at {}", exact_current_time);
+
+    let language = match payload.language.as_str() {
+        "python" => Language {
+            name: "python".to_string(),
+            source_file: "main.py".to_string(),
+            compile_cmd: None,
+            run_cmd: "/usr/bin/python3 main.py".to_string(),
+            is_compiled: false,
+        },
+        "cpp" => Language {
+            name: "cpp".to_string(),
+            source_file: "main.cpp".to_string(),
+            compile_cmd: Some("/usr/bin/g++ -O0 -Wall -Wextra -Werror -Wpedantic -Wfatal-errors main.cpp".to_string()),
+            run_cmd: "./a.out".to_string(),
+            is_compiled: true,
+        },
+        "javascript" => Language {
+            name: "javascript".to_string(),
+            source_file: "main.js".to_string(),
+            compile_cmd: None,
+            run_cmd: "/usr/bin/node main.js".to_string(),
+            is_compiled: false,
+        },
+        "java" => Language {
+            name: "java".to_string(),
+            source_file: "Main.java".to_string(),
+            compile_cmd: Some("/usr/bin/javac Main.java".to_string()),
+            run_cmd: "/usr/bin/java Main".to_string(),
+            is_compiled: false,
+        },
+        "sql" => Language {
+            name: "sql".to_string(),
+            source_file: "main.sql".to_string(),
+            compile_cmd: None,
+            run_cmd: "sqlite3".to_string(),
+            is_compiled: false,
+        },
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let settings = ExecutionSettings {
+        cpu_time_limit: payload.time_limit.unwrap_or(2.0),
+        memory_limit: payload.memory_limit.unwrap_or(128_000),
+        stack_limit: payload.stack_limit.unwrap_or(64_000),
+        ..Default::default()
+    };
+
+    // let exact_current_time = std::time::SystemTime::now()
+    //     .duration_since(std::time::UNIX_EPOCH)
+    //     .unwrap()
+    //     .as_micros();
+    // println!("job prepared {}", exact_current_time);
+    let job = Job::new(payload.code, language)
+        .with_stdin(payload.input)
+        .with_expected_output(payload.expected)
+        .set_limits(
+            settings.cpu_time_limit,
+            settings.memory_limit,
+            settings.stack_limit,
+            60,
+        );
+
+    let job_id = create_job(&redis, job)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(json!({ "status": "created", "id": job_id })))
+}
+
+async fn handle_check(
+    State(redis): State<Arc<RedisClient>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let job = check_job(&redis, &job_id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let send_output = &json!({
+        "started_at": job.started_at.unwrap_or(0),
+        "finished_at": job.finished_at.unwrap_or(0),
+        "stdout": job.output.stdout.unwrap_or("".to_string()),
+        "time": job.output.time.unwrap_or(0.0),
+        "memory": job.output.memory.unwrap_or(0),
+        "stderr": job.output.stderr.unwrap_or("".to_string()),
+        "token": job.id,
+        "compile_output": job.output.compile_output.unwrap_or("".to_string()),
+        "message": job.output.message.unwrap_or("".to_string()),
+        "status": {
+            "id": job.status.id(),
+            "description": format!("{}",job.status),
+        },
+    });
+
+
+    Ok(Json(json!(send_output)))
+}
+
+async fn handle_debug(
+    Json(body): Json<debugger::DebugRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    println!("debug request received");
+
+  // Simulate a debug response for demonstration purposes
+//   let response = json!({
+//     "status": "success",
+//     "input_received": body.code,
+//     "debug_output": "This is a debug output for input: ".to_string() + &body.input,
+// });
+
+
+let payload = debugger::DebugRequest {
+    code: body.code,
+    input: body.input,
+    language: body.language,
+};
+
+let response2 = match debugger::debug(payload).await {
+    Ok(response) => response,
+    Err(err) => {
+        eprintln!("Debugger error: {:?}", err);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+};
+Ok(Json(json!(*response2)))
+}
+
+
+=== .\src\core\settings.rs ===
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionSettings {
+    pub cpu_time_limit: f64,
+    pub wall_time_limit: f64,
+    pub memory_limit: u64,
+    pub stack_limit: u64,
+    pub max_processes: u32,
+    pub max_file_size: u64,
+    pub enable_network: bool,
+}
+
+impl Default for ExecutionSettings {
+    fn default() -> Self {
+        Self {
+            cpu_time_limit: 2.0,
+            wall_time_limit: 5.0,
+            memory_limit: 128_000,
+            stack_limit: 64_000,
+            max_processes: 60,
+            max_file_size: 4096,
+            enable_network: false,
+        }
+    }
+}
+
+=== .\src\utils\cleanup.sh ===
+id=$0
+rm -rf $id
+
+=== .\src\utils\compile.sh ===
+#!/bin/bash
+# compile.sh
+case "$LANGUAGE" in
+    "python")
+        python3 -m py_compile code.py
+        ;;
+    "cpp")
+        g++ -O2 -w -std=c++17 code.cpp -o program
+        ;;
+    "c")
+        gcc -O2 -w -std=c11 code.c -o program
+        ;;
+    *)
+        echo "Unsupported language"
+        exit 1
+        ;;
+esac
+
+
+=== .\src\utils\mod.rs ===
+pub mod utils;  
+
+=== .\src\utils\run_script.sh ===
+#!/bin/bash
+# run.sh
+case "$LANGUAGE" in
+    "python")
+        python3 code.py
+        ;;
+    "cpp"|"c")
+        ./program
+        ;;
+    *)
+        echo "Unsupported language"
+        exit 1
+        ;;
+esac
+
+=== .\src\utils\utils.rs ===
+use crate::{client::redis::RedisClient, core::job::Job};
+
+/// Creates a new job and stores it in Redis.
+pub async fn create_job(redis: &RedisClient, job: Job) -> Result<String, String> {
+    let job_id = job.id.to_string();
+
+
+    // redis
+    //     .store_job(&job_id, &job, None)
+    //     .await
+    //     .map_err(|e| e.to_string())?;
+
+    // redis
+    //     .enqueue_job("jobs", &job)
+    //     .await
+    //     .map_err(|e| e.to_string())?;
+
+    redis.create_job(&job_id, "jobs", &job)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(job_id)
+}
+
+/// Retrieves a job from Redis by its ID.
+pub async fn check_job(redis: &RedisClient, job_id: &str) -> Result<Job, String> {
+    let data=redis
+        .get_job(job_id)
+        .await
+        .map_err(|e| e.to_string());
+    match data {
+        Ok(Some(job)) => Ok(job),
+        Ok(None) => Err("Job not found".to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+
+=== .\src\vendors\debugger.rs ===
+use serde_json::Value;
+use std::process::Stdio;
+use axum::{http::StatusCode, Json};
+use tokio::process::Command;
+use tokio::fs;
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct DebugRequest {
+    pub code: String,
+    pub language: String,
+    pub input: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct DebugStep {
+    line: u32,
+    code: String,
+    locals: Value, // Use serde_json::Value to handle arbitrary JSON
+    stdout: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct DebugResponse {
+    steps: Vec<DebugStep>,
+}
+
+#[derive(Debug)]
+enum ExecutionError {
+    DebugParseError,
+    ExecutionFailed,
+}
+
+pub async fn debug(payload: DebugRequest) -> Result<Json<DebugResponse>, StatusCode> {
+    let steps = execute_with_debug(&payload.code, &payload.input)
+        .await
+        .map_err(|e| {
+            eprintln!("Debug error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(steps))
+}
+
+async fn execute_with_debug(code: &str, _input: &str) -> Result<DebugResponse, ExecutionError> {
+    // Write the code to a temporary file
+    fs::write("debugger/temp.py", code)
+        .await
+        .map_err(|e| {
+            eprintln!("Failed to write temp file: {:?}", e);
+            ExecutionError::DebugParseError
+        })?;
+
+    let file_path = "debugger/temp.py";
+
+    // Execute the Python debugger
+    let output = Command::new("python3")
+        .arg("./debugger/debug.py")
+        .arg(file_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| {
+            eprintln!("Failed to execute python: {:?}", e);
+            ExecutionError::ExecutionFailed
+        })?;
+
+    // Debug logging
+    eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    // Parse the debug steps directly from stdout
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| {
+            eprintln!("UTF-8 conversion error: {:?}", e);
+            ExecutionError::DebugParseError
+        })?;
+
+    let steps: DebugResponse = serde_json::from_str(&stdout)
+        .map_err(|e| {
+            eprintln!("JSON parse error: {:?}", e);
+            ExecutionError::DebugParseError
+        })?;
+
+    Ok(steps)
+}
+
+=== .\src\vendors\isolate.rs ===
+use crate::{
+    client::redis::RedisClient,
+    core::{Job, JobStatus},
+};
+use futures::TryFutureExt;
+use redis::RedisError;
+use std::{
+    fs::{self, File},
+    io::Error,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::process::Command;
+
+#[derive(Debug)]
+pub struct Metadata {
+    pub time: f64,
+    pub memory: u64,
+    pub exit_code: i32,
+    pub message: String,
+    pub status: String,
+}
+
+#[derive(Clone)]
+pub struct IsolateExecutor {
+    redis: RedisClient,
+}
+
+impl IsolateExecutor {
+    pub fn new(redis: RedisClient) -> Self {
+        Self { redis }
+    }
+    pub async fn execute(&self, job: &mut Job) -> Result<JobStatus, Error> {
+        let box_id = job.id % 2147483647;
+        job.status = JobStatus::Processing;
+        job.started_at = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap(),
+        );
+
+        // Initialize new box
+        let init_output = Command::new("isolate")
+            .args(&["-b", &box_id.to_string(), "--cg", "--init"])
+            .output()
+            .map_err(|e| format!("Failed to initialize box: {:?}", e))
+            .await
+            .unwrap();
+
+        let (file_path, metadata_file, stdin_file, stdout_file, stderr_file) =
+                self.setup_files(job, &init_output.stdout)?;
+
+        // Run compilation if needed
+        if let Some(compile_cmd) = &job.language.compile_cmd {
+            let compile_parts: Vec<&str> = compile_cmd.split_whitespace().collect();
+            let compile_executable = compile_parts[0];
+            let compile_args = &compile_parts[1..];
+
+            let compile_status = Command::new("isolate")
+                .args(&[
+                    "--cg",
+                    "-b",
+                    &box_id.to_string(),
+                    "-M",
+                    metadata_file.as_str(),
+                    "--process=60",
+                    "-t",
+                    "5",
+                    "-x",
+                    "0",
+                    "-w",
+                    "10",
+                    "-k",
+                    "12800",
+                    "-f",
+                    "1024",
+                    format!("--cg-mem={}", job.settings.memory_limit.to_string()).as_str(),
+                    "-E",
+                    "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"",
+                    "-E",
+                    "HOME=/tmp",
+                    "-d",
+                    "/etc:noexec",
+                    "--run",
+                    "--",
+                    "/usr/bin/sh",
+                    "-c",
+                    format!(
+                        "{} {} 2> /box/compile_output",
+                        compile_executable,
+                        compile_args.join(" ")
+                    )
+                    .as_str(),
+                ])
+                .output()
+                .map_err(|e| format!("Failed to run compilation: {:?}", e))
+                .await
+                .unwrap();
+
+            if !compile_status.status.success() {
+                let compile_output = fs::read_to_string(format!("{}/compile_output", file_path))
+                    .expect(format!("Failed to read compile output for job {}", job.id).as_str());
+
+                job.output.compile_output = Some(compile_output);
+                job.status = JobStatus::CompilationError;
+                self.update_job_in_redis(job).await.unwrap();
+                return Ok(JobStatus::CompilationError);
+            }
+        }
+
+        let run_parts: Vec<&str> = job.language.run_cmd.split_whitespace().collect();
+        let run_executable = run_parts[0];
+        let run_args = &run_parts[1..];
+
+        let _ = Command::new("isolate")
+            .args(&[
+                "--cg",
+                "-b",
+                &box_id.to_string(),
+                "-M",
+                &metadata_file,
+                "--process=60",
+                "-t",
+                &job.settings.cpu_time_limit.to_string(),
+                "-x",
+                "0",
+                "-w",
+                "10",
+                "-k",
+                "128000",
+                format!("--cg-mem={}", job.settings.memory_limit.to_string()).as_str(),
+                "-E",
+                "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"",
+                "-E",
+                "HOME=/tmp",
+                "-d",
+                "/etc:noexec",
+                "--run",
+                "--",
+                "/usr/bin/sh",
+                "-c",
+                format!(
+                    "{} {} > /box/stdout 2> /box/stderr",
+                    run_executable,
+                    run_args.join(" ")
+                )
+                .as_str(),
+            ])
+            .stdin(stdin_file)
+            .output()
+            .map_err(|e| format!("Failed to run job: {:?}", e))
+            .await
+            .unwrap();
+
+        let stdout_content = fs::read_to_string(&stdout_file).unwrap();
+        let stderr_content = fs::read_to_string(&stderr_file).unwrap();
+
+        job.output.stdout = Some(stdout_content);
+        job.output.stderr = Some(stderr_content);
+
+        let metadata = match self.get_metadata(box_id) {
+            Ok(meta) => meta,
+            Err(e) => {
+                job.status = JobStatus::InternalError;
+                self.update_job_in_redis(job).await.unwrap();
+                return Ok(JobStatus::InternalError);
+            }
+        };
+
+        job.finished_at = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap(),
+        );
+
+        job.output.memory = Some(metadata.memory);
+        job.output.time = Some(metadata.time);
+        job.output.exit_code = Some(metadata.exit_code);
+        job.output.message = Some(metadata.message);
+        job.status = determine_status(
+            metadata.status,
+            metadata.exit_code,
+            &job.output.stdout.clone().unwrap(),
+            &job.expected_output,
+        );
+
+        self.update_job_in_redis(job).await.unwrap();
+
+        Ok(job.status.clone())
+    }
+
+    async fn update_job_in_redis(&self, job: &Job) -> Result<(), RedisError> {
+        let job_id = job.id.to_string();
+        self.redis.store_job(&job_id, job, None).await.map_err(|_| {
+            RedisError::from((redis::ErrorKind::IoError, "Failed to store job in Redis"))
+        })
+    }
+
+    fn get_metadata(&self, box_id: u64) -> Result<Metadata,Error> {
+        let metadata_file = format!("/var/local/lib/isolate/{}/box/metadata", box_id);
+        let metadata = fs::read_to_string(metadata_file)
+            .map_err(|_| JobStatus::RuntimeError)
+            .map_err(|_| JobStatus::InternalError)
+            .map_err(|_| Error::new(std::io::ErrorKind::Other, "Failed to read metadata"))?;
+
+        let lines: Vec<&str> = metadata.lines().collect();
+
+        let meta = lines.iter().map(|&pairs| {
+            let mut parts = pairs.splitn(2, ':');
+            let key = parts.next().unwrap();
+            let value = parts.next().unwrap();
+            (key, value)
+        });
+
+        let mut m: Metadata = Metadata {
+            time: 0.0,
+            memory: 0,
+            exit_code: 0,
+            message: "".to_string(),
+            status: "".to_string(),
+        };
+
+        meta.for_each(|f| match f.0 {
+            "time" => m.time = f.1.parse().unwrap(),
+            "max-rss" => m.memory = f.1.parse().unwrap(),
+            "cg-mem" => m.memory = f.1.parse().unwrap(),
+            "exitcode" => m.exit_code = f.1.parse().unwrap(),
+            "message" => m.message = f.1.to_string(),
+            "status" => m.status = f.1.to_string(),
+            _ => {}
+        });
+
+        Ok(m)
+    }
+
+    fn setup_files(
+        self: &Self,
+        job: &Job,
+        stdout: &[u8],
+    ) -> Result<(String, String, File, String, String), Error> {
+        let box_path = String::from_utf8_lossy(&stdout).trim().to_string();
+        let file_path = format!("{}/box", box_path);
+        let stdin_file = format!("{}/stdin", file_path);
+        let stdout_file = format!("{}/stdout", file_path);
+        let stderr_file = format!("{}/stderr", file_path);
+        let metadata_file = format!("{}/metadata", file_path);
+
+        // Write source code
+        let source_path = format!("{}/{}", file_path, job.language.source_file);
+
+        fs::write(&source_path, &job.source_code)?;
+        fs::write(&stdin_file, &job.stdin)?;
+
+        let stdin_file = File::open(stdin_file)?;
+
+        Ok((
+            file_path,
+            metadata_file,
+            stdin_file,
+            stdout_file,
+            stderr_file,
+        ))
+    }
+}
+
+fn determine_status(
+    status: String,
+    exitcode: i32,
+    stdout: &String,
+    expected: &String,
+) -> JobStatus {
+    match status.as_str() {
+        "TO" => JobStatus::TimeLimitExceeded,
+        "SG" => find_typeof_runtime(exitcode),
+        "RE" => JobStatus::RuntimeError("NZEC".to_string()),
+        "XX" => JobStatus::InternalError,
+        _ if (expected.is_empty() || stdout.trim() == expected.trim()) => JobStatus::Accepted,
+        _ => JobStatus::WrongAnswer,
+    }
+}
+
+fn find_typeof_runtime(exitcode: i32) -> JobStatus {
+    match exitcode {
+        11 => JobStatus::RuntimeError("SIGSEGV".to_string()),
+        25 => JobStatus::RuntimeError("SIGXFSZ".to_string()),
+        8 => JobStatus::RuntimeError("SIGFPE".to_string()),
+        6 => JobStatus::RuntimeError("SIGABRT".to_string()),
+        _ => JobStatus::RuntimeError("Other".to_string()),
+    }
+}
+
+
+=== .\src\vendors\mod.rs ===
+pub mod isolate;
+pub mod debugger;
+// pub mod sqlizer;
+
+=== .\src\vendors\sqlizer.rs ===
+use std::{error::Error, fs, process::Command};
+use std::fmt;
+use std::path::PathBuf;
+
+use crate::core::pool::Code;
+
+use super::isolate::Metadata;
+
+#[derive(Debug)]
+pub enum SqlizerError {
+    IoError(std::io::Error),
+    DockerError(String),
+    OutputMismatch,
+}
+
+impl fmt::Display for SqlizerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SqlizerError::IoError(e) => write!(f, "IO error: {}", e),
+            SqlizerError::DockerError(e) => write!(f, "Docker error: {}", e),
+            SqlizerError::OutputMismatch => write!(f, "Query output did not match expected output"),
+        }
+    }
+}
+
+
+pub struct Sqlizer {
+    box_id: u128,
+    sql_dir: PathBuf,
+}
+
+impl fmt::Display for Sqlizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Sqlizer #{}", self.box_id)
+    }
+}
+
+impl Sqlizer {
+    pub fn new(code: Code) -> Result<Self, SqlizerError> {
+        let box_id = code.id % 1000;
+        let sql_dir = PathBuf::from(format!("/tmp/sqlizer/{}", box_id));
+
+        fs::create_dir_all(&sql_dir)
+            .map_err(SqlizerError::IoError)?;
+
+        let paths = [
+            ("query.sql", &code.source_code),
+            ("correct_query.sql", &code.correct_query_code),
+            ("table.sql", &code.stdin),
+        ];
+
+        // Initialize files
+        for (filename, content) in paths.iter() {
+            fs::write(sql_dir.join(filename), content)
+                .map_err(SqlizerError::IoError)?;
+        }
+
+        // Copy script file
+        let script = fs::read_to_string("./sql_script.sh")
+            .map_err(SqlizerError::IoError)?;
+        fs::write(sql_dir.join("sql_script.sh"), script)
+            .map_err(SqlizerError::IoError)?;
+
+        Ok(Sqlizer {
+            box_id,
+            sql_dir,
+        })
+    }
+
+    pub fn run(&self) -> Result<Metadata, SqlizerError> {
+        let output = Command::new("docker")
+            .arg("run")
+            .arg("-v")
+            .arg(format!("{}:/sqlizer", self.sql_dir.display()))
+            .arg("-v")
+            .arg("/data:/data")
+            .arg("sqlizer")
+            .output()
+            .map_err(|e| SqlizerError::DockerError(e.to_string()))?;
+
+        if !output.status.success() {
+            return Err(SqlizerError::DockerError(
+                String::from_utf8_lossy(&output.stderr).to_string()
+            ));
+        }
+
+        let read_file = |filename: &str| -> Result<String, SqlizerError> {
+            fs::read_to_string(self.sql_dir.join(filename))
+                .map_err(SqlizerError::IoError)
+        };
+
+        let user_output = read_file("user_output.sql")?;
+        let expected_output = read_file("expected_output.sql")?;
+        let error_output = read_file("error_output.sql")?;
+        let metadata_output = read_file("metadata.json")?;
+
+        let result = user_output == expected_output;
+
+        let mut metadata = Metadata {
+            time: 0.0,
+            wall_time: 0.0,
+            memory: 0,
+            std_out: user_output,
+            std_err: error_output,
+            exit_code: if result { 0 } else { 1 },
+            exit_signal: 0,
+            message: if result { "Correct" } else { "Incorrect" }.to_string(),
+            status: if result { "Correct" } else { "Incorrect" }.to_string(),
+        };
+
+        // Parse metadata output
+        for line in metadata_output.lines() {
+            let mut parts = line.split(':');
+            if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                match key.trim() {
+                    "User time (seconds)" => metadata.time = value.trim().parse().unwrap_or(0.0),
+                    "System time (seconds)" => metadata.wall_time = value.trim().parse().unwrap_or(0.0),
+                    "Maximum resident set size (kbytes)" => metadata.memory = value.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(metadata)
+    }
+}
+
+=== .\src\vendors\sql_script.sh ===
+#!/bin/sh
+set -e
+
+# Initialize PostgreSQL if data directory is empty
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    mkdir -p "$PGDATA"
+    chmod 700 "$PGDATA"
+    initdb -D "$PGDATA"
+    
+    # Start PostgreSQL
+    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
+    
+    # Create user and database
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+        CREATE USER $POSTGRES_USER WITH PASSWORD '$POSTGRES_PASSWORD';
+        CREATE DATABASE $POSTGRES_DB;
+        GRANT ALL PRIVILEGES ON DATABASE $POSTGRES_DB TO $POSTGRES_USER;
+EOSQL
+else
+    # Just start PostgreSQL if data directory exists
+    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
+fi
+
+# Function to execute SQL and capture output
+execute_sql() {
+    QUERY_FILE=$1
+    OUTPUT_FILE=$2
+    ERROR_FILE=$3
+    
+    /usr/bin/time -v psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$QUERY_FILE" \
+        > "$OUTPUT_FILE" 2> "$ERROR_FILE"
+}
+
+# Import tables from table.sql
+psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /sqlizer/table.sql
+
+# Execute user's query and correct query
+execute_sql "/sqlizer/query.sql" "/sqlizer/user_output.sql" "/sqlizer/error_output.sql"
+execute_sql "/sqlizer/correct_query.sql" "/sqlizer/expected_output.sql" "/sqlizer/error_correct.sql"
+
+# Capture execution metadata
+/usr/bin/time -v true > /sqlizer/metadata.json
+
+# Stop PostgreSQL
+pg_ctl -D "$PGDATA" -m fast -w stop
+
+exit 0
+
+=== .\src\worker\mod.rs ===
+use crate::{client::redis::RedisClient, core::job::Job, vendors::isolate::IsolateExecutor};
+use futures::StreamExt;
+use std::{process::Command, sync::Arc};
+
+pub struct Worker {
+    redis: Arc<RedisClient>,
+    isolate_executor: IsolateExecutor,
+}
+
+impl Worker {
+    pub fn new(redis: RedisClient) -> Self {
+        Self {
+            redis: Arc::new(redis.clone()),
+            isolate_executor: IsolateExecutor::new(redis),
+        }
+    }
+
+    pub async fn start(&self, concurrency: usize) {
+        let mut jobs_stream =
+            futures::stream::repeat_with(|| self.redis.get_job_from_queue::<Job>("jobs"))
+                .buffer_unordered(concurrency);
+
+        while let Some(Ok(job)) = jobs_stream.next().await {
+            let executor = self.isolate_executor.clone();
+            tokio::spawn(async move {
+                let max_retries = 3;
+                let mut retry_count = 0;
+                if let Some(mut job) = job {
+                    loop {
+                        let result = executor.execute(&mut job).await;
+                        match result {
+                            Ok(_) => {
+                                cleanup_job(job.id).await;
+                                break;
+                            }
+                            Err(_) => {
+                                // println!("Job {} failed: {:?}", job.id, e);
+                                retry_count += 1;
+                                cleanup_job(job.id).await;
+                                if retry_count >= max_retries {
+                                    println!("Job {} failed after {} retries", job.id, max_retries);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+async fn cleanup_job(job_id: u64) {
+    let box_id = job_id % 2147483647;
+    println!("cleaning {}", box_id);
+    if let Err(e) = Command::new("isolate")
+        .args(&["--cg", "-b", &box_id.to_string(), "--cleanup"])
+        .output()
+    {
+        eprintln!("Failed to cleanup isolate box {}: {:?}", box_id, e);
+    }
+}
+
+// Benchmark Results: my own judge
+// ┌─────────┬───────────┬─────────────────────┬────────────────────┬────────────────────┬────────────────────┐
+// │ (index) │ batchSize │ batchTime           │ minTime            │ maxTime            │ avgTime            │
+// ├─────────┼───────────┼─────────────────────┼────────────────────┼────────────────────┼────────────────────┤
+// │ 0       │ 1         │ 0.47198826199999994 │ 0.423468856        │ 0.423468856        │ 0.423468856        │
+// │ 1       │ 5         │ 0.6930421600000001  │ 0.6294909520000002 │ 0.686258702        │ 0.6536879556       │
+// │ 2       │ 10        │ 1.1036043050000002  │ 0.9300072039999998 │ 1.0959709219999998 │ 1.0364192316999996 │
+// │ 3       │ 20        │ 1.986463447         │ 1.6489298740000005 │ 1.9724271189999996 │ 1.8634631091500005 │
+// │ 4       │ 50        │ 5.104834258         │ 3.7948678549999997 │ 5.065155109        │ 4.713057229080001  │
+// │ 5       │ 100       │ 9.856603473000002   │ 3.957500817        │ 9.771785607        │ 8.90954378256      │
+// │ 6       │ 200       │ 11.312671159999997  │ 10.674545425       │ 11.260640411       │ 11.119756015995    │
+// └─────────┴───────────┴─────────────────────┴────────────────────┴────────────────────┴────────────────────┘
+
+
+
+// Benchmark Results: jugde0
+// ┌─────────┬───────────┬────────────────────┬────────────────────┬────────────────────┬────────────────────┐
+// │ (index) │ batchSize │ batchTime          │ minTime            │ maxTime            │ avgTime            │
+// ├─────────┼───────────┼────────────────────┼────────────────────┼────────────────────┼────────────────────┤
+// │ 0       │ 1         │ 1.0795797999999999 │ 1.0235087          │ 1.0235087          │ 1.0235087          │
+// │ 1       │ 5         │ 1.0928858999999997 │ 1.027861           │ 1.0667128          │ 1.0480198600000001 │
+// │ 2       │ 10        │ 2.2231248999999997 │ 2.0619432999999994 │ 2.1508925          │ 2.1195240699999998 │
+// │ 3       │ 20        │ 3.5344043000000003 │ 3.2564444999999997 │ 3.4778047000000005 │ 3.364398630000001  │
+// │ 4       │ 100       │ 14.747170599999999 │ 13.2796602         │ 14.018950199999999 │ 13.695532470999996 │
+// │ 5       │ 200       │ 29.541593299999995 │ 26.8702085         │ 28.140297100000005 │ 27.459659780500015 │
+// └─────────┴───────────┴────────────────────┴────────────────────┴────────────────────┴────────────────────┘
+
