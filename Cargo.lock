@@ -541,12 +541,14 @@ dependencies = [
  "bincode",
  "deadpool-redis",
  "futures",
+ "num_cpus",
  "redis 0.23.3",
  "serde",
  "serde_json",
  "tokio",
  "tokio-console",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

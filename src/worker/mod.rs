@@ -1,6 +1,6 @@
 use crate::{client::redis::RedisClient, core::job::Job, vendors::isolate::IsolateExecutor};
-use futures::StreamExt;
-use std::{process::Command, sync::Arc};
+use tokio::task;
+use std::{process::Command, sync::Arc, time::Duration};
 
 pub struct Worker {
     redis: Arc<RedisClient>,
@@ -16,36 +16,59 @@ impl Worker {
     }
 
     pub async fn start(&self, concurrency: usize) {
-        let mut jobs_stream =
-            futures::stream::repeat_with(|| self.redis.get_job_from_queue::<Job>("jobs"))
-                .buffer_unordered(concurrency);
-
-        while let Some(Ok(job)) = jobs_stream.next().await {
+        let mut handles = Vec::with_capacity(concurrency);
+        
+        for _ in 0..concurrency {
+            let redis = Arc::clone(&self.redis);
             let executor = self.isolate_executor.clone();
-            tokio::spawn(async move {
-                let max_retries = 3;
-                let mut retry_count = 0;
-                if let Some(mut job) = job {
-                    loop {
-                        let result = executor.execute(&mut job).await;
-                        match result {
-                            Ok(_) => {
-                                cleanup_job(job.id).await;
-                                break;
-                            }
-                            Err(_) => {
-                                // println!("Job {} failed: {:?}", job.id, e);
-                                retry_count += 1;
-                                cleanup_job(job.id).await;
-                                if retry_count >= max_retries {
-                                    println!("Job {} failed after {} retries", job.id, max_retries);
-                                    break;
+            
+            let handle = task::spawn(async move {
+                loop {
+                    match redis.get_job_from_queue::<Job>("jobs").await {
+                        Ok(Some(mut job)) => {
+                            
+                            let max_retries = 3;
+                            let mut retry_count = 0;
+                            
+                            loop {
+                                let result = executor.execute(&mut job).await;
+
+                                match result {
+                                    Ok(_) => {
+                                        cleanup_job(job.id).await;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        println!("Job {} failed: {:?}", job.id, e);
+                                        retry_count += 1;
+                                        cleanup_job(job.id).await;
+                                        if retry_count >= max_retries {
+                                            println!("Job {} failed after {} retries", job.id, max_retries);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
+                        },
+                        Ok(None) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        },
+                        Err(e) => {
+                            eprintln!("Error fetching job from queue: {:?}", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
             });
+            
+            handles.push(handle);
+        }
+        
+        // Wait for all worker tasks
+        for handle in handles {
+            if let Err(e) = handle.await {
+                eprintln!("Worker task failed: {:?}", e);
+            }
         }
     }
 }

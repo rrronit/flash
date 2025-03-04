@@ -18,6 +18,7 @@ pub fn server(redis_client: RedisClient) -> Router {
         .route("/create", post(handle_create))
         .route("/check/:job_id", get(handle_check))
         .route("/debug", post(handle_debug))
+        .route("/health",get(handle_get))
         .with_state(Arc::new(redis_client))
 }
 
@@ -30,6 +31,10 @@ struct CreateJobRequest {
     time_limit: Option<f64>,
     memory_limit: Option<u64>,
     stack_limit: Option<u64>,
+}
+
+async fn handle_get()->String{
+    "ok".to_string()
 }
 
 async fn handle_create(
